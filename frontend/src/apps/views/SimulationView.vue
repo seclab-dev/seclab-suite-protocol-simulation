@@ -63,8 +63,13 @@ const getRuleName = (rule?: SimRule | null) => {
  */
 const activeTab = ref<"deployments" | "rules" | "logs">("deployments");
 
-/** 全局及局部异步操作的加载动画控制状态 */
+/** 非列表业务操作的全局加载状态。 */
 const isLoading = ref(false);
+
+/** 各页签表格区域的独立加载状态，避免列表刷新遮挡整个应用。 */
+const deploymentsLoading = ref(false);
+const rulesLoading = ref(false);
+const logsLoading = ref(false);
 
 const confirmationState = ref({
   visible: false,
@@ -423,7 +428,8 @@ const handleUploadPackage = async (event: Event) => {
 /**
  * 异步拉取并加载数据库中存储的协议仿真规则列表
  */
-const loadRules = async () => {
+const loadRules = async (silent = false) => {
+  if (!silent) rulesLoading.value = true;
   try {
     const res = await simulationApi.listRules();
     if (res.success && res.data) {
@@ -431,6 +437,8 @@ const loadRules = async () => {
     }
   } catch {
     notificationStore.error(t("app.simulation.rules.messages.loadFailed"));
+  } finally {
+    if (!silent) rulesLoading.value = false;
   }
 };
 
@@ -457,7 +465,7 @@ const loadNodes = async () => {
  */
 const loadLogs = async (silent = false) => {
   if (!selectedNodeId.value) return;
-  if (!silent) isLoading.value = true;
+  if (!silent) logsLoading.value = true;
   try {
     const logRes = await simulationApi.listLogs({
       page: logPage.value,
@@ -472,7 +480,7 @@ const loadLogs = async (silent = false) => {
       t("app.simulation.deployments.messages.loadInstancesFailed"),
     );
   } finally {
-    if (!silent) isLoading.value = false;
+    if (!silent) logsLoading.value = false;
   }
 };
 
@@ -483,7 +491,7 @@ const loadLogs = async (silent = false) => {
 const loadNodeInstancesAndLogs = async (silent = false) => {
   if (!selectedNodeId.value) return;
   selectedInstanceIds.value = [];
-  if (!silent) isLoading.value = true;
+  if (!silent) deploymentsLoading.value = true;
   try {
     const instRes = await simulationApi.listInstances();
     if (instRes.success && instRes.data) {
@@ -496,7 +504,7 @@ const loadNodeInstancesAndLogs = async (silent = false) => {
       t("app.simulation.deployments.messages.loadInstancesFailed"),
     );
   } finally {
-    if (!silent) isLoading.value = false;
+    if (!silent) deploymentsLoading.value = false;
   }
 };
 
@@ -513,9 +521,12 @@ watch(activeTab, (tab) => {
   if (tab === "rules") {
     void loadCurrentPackage();
     void loadRules();
-  } else if (tab === "deployments" || tab === "logs") {
+  } else if (tab === "deployments") {
     void loadNodes();
     void loadNodeInstancesAndLogs();
+  } else if (tab === "logs") {
+    void loadNodes();
+    void loadLogs();
   }
   if (tab !== "logs") {
     isAutoRefreshLogs.value = false;
@@ -1714,7 +1725,7 @@ const handleDownloadPcap = async (row: SimInstance) => {
         </div>
 
         <div class="main-panel card-bg flex-column flex-1" data-slot="content">
-          <div class="flex-1 overflow-auto">
+          <div class="table-body-region flex-1 overflow-auto">
             <SecLabTable
               :data="instances"
               :columns="instanceColumns"
@@ -1869,6 +1880,11 @@ const handleDownloadPcap = async (row: SimInstance) => {
                 </div>
               </template>
             </SecLabTable>
+            <SecLabLoading
+              :loading="deploymentsLoading"
+              cover
+              data-ui="sim-deployments-loading"
+            />
           </div>
         </div>
       </div>
@@ -1954,7 +1970,7 @@ const handleDownloadPcap = async (row: SimInstance) => {
         </div>
 
         <div class="main-panel card-bg flex-column flex-1" data-slot="content">
-          <div class="flex-1 overflow-auto">
+          <div class="table-body-region flex-1 overflow-auto">
             <SecLabTable
               :data="pagedRules"
               :columns="extendedRuleColumns"
@@ -2066,6 +2082,11 @@ const handleDownloadPcap = async (row: SimInstance) => {
                 </div>
               </template>
             </SecLabTable>
+            <SecLabLoading
+              :loading="rulesLoading"
+              cover
+              data-ui="sim-rules-loading"
+            />
           </div>
 
           <!-- 分页器 -->
@@ -2169,7 +2190,7 @@ const handleDownloadPcap = async (row: SimInstance) => {
         </div>
 
         <div class="main-panel card-bg flex-column flex-1" data-slot="content">
-          <div class="flex-1 overflow-auto">
+          <div class="table-body-region flex-1 overflow-auto">
             <SecLabTable
               :data="logs"
               :columns="logColumns"
@@ -2203,6 +2224,11 @@ const handleDownloadPcap = async (row: SimInstance) => {
                 </div>
               </template>
             </SecLabTable>
+            <SecLabLoading
+              :loading="logsLoading"
+              cover
+              data-ui="sim-logs-loading"
+            />
           </div>
 
           <!-- 分页器 -->
@@ -2931,6 +2957,10 @@ const handleDownloadPcap = async (row: SimInstance) => {
 .main-panel > .overflow-auto {
   display: flex;
   flex-direction: column;
+}
+
+.table-body-region {
+  position: relative;
 }
 
 .panel-header {
