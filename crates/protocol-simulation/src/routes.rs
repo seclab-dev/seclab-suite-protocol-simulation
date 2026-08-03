@@ -199,8 +199,6 @@ async fn deploy_instance(
     let config_json = serde_json::from_str::<serde_json::Value>(&rule.config_json)
         .unwrap_or_else(|_| serde_json::json!({}));
     let agent_payload = StartWorkloadRequest {
-        suite_id: state.config.suite_id.clone(),
-        suite_instance_id: state.config.suite_instance_id.clone(),
         workload_kind: "simulation-rule".to_string(),
         workload_name: rule.id.clone(),
         image: state.config.engine_image.clone(),

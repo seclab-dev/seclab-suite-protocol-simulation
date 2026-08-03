@@ -53,3 +53,5 @@ API 服务默认监听 `8080`，数据目录为 `/data`，可通过 `SECLAB_SUIT
 套件 API 容器只维护套件状态和调用 Agent。协议仿真实例由 Agent 通过 suite workload API 拉起 engine 容器，容器生命周期和 PCAP 取证归属当前节点 Agent。
 
 规则包导入、实例部署、下线和取证接口由套件 API 提供；主控只负责安装套件、代理入口、注入运行配置和展示统一通知。
+
+SecLab 会把 `/run/seclab-agent/runtime.json` 及实例令牌以只读方式注入套件。套件 API 根据描述自动连接本地 UDS 或节点 mTLS HTTPS，不读取 Agent mode，也不接受客户端自行指定套件实例身份。

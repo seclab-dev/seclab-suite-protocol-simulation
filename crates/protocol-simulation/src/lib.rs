@@ -17,10 +17,7 @@ pub struct Config {
     pub http_port: u16,
     pub data_dir: PathBuf,
     pub frontend_dir: PathBuf,
-    pub agent_base_url: String,
-    pub agent_certs_dir: PathBuf,
-    pub agent_socket_path: Option<PathBuf>,
-    pub agent_accept_invalid_hostnames: bool,
+    pub agent_runtime_path: PathBuf,
     pub suite_id: String,
     pub suite_instance_id: String,
     pub engine_image: String,
@@ -39,13 +36,10 @@ impl Config {
         let http_port = env_parse("PORT", 8080);
         let data_dir = PathBuf::from(env_string("SECLAB_SUITE_DATA_DIR", "/data"));
         let frontend_dir = PathBuf::from(env_string("SECLAB_FRONTEND_DIR", "/app/public"));
-        let agent_base_url = env_string("SECLAB_AGENT_BASE_URL", "https://127.0.0.1:7311");
-        let agent_certs_dir =
-            PathBuf::from(env_string("SECLAB_AGENT_CERTS_DIR", "/run/seclab-agent"));
-        let agent_socket_path = env_optional_path("SECLAB_AGENT_SOCKET_PATH")
-            .or_else(|| env_optional_path("SECLAB_AGENT_SOCKET"));
-        let agent_accept_invalid_hostnames =
-            env_bool("SECLAB_AGENT_ACCEPT_INVALID_HOSTNAMES", true);
+        let agent_runtime_path = PathBuf::from(env_string(
+            "SECLAB_AGENT_RUNTIME",
+            "/run/seclab-agent/runtime.json",
+        ));
         let suite_id = env_string("SECLAB_SUITE_ID", "seclab.protocol-simulation");
         let suite_instance_id = env_string("SECLAB_SUITE_INSTANCE_ID", "protocol-simulation-local");
         let engine_image = env_string(
@@ -58,10 +52,7 @@ impl Config {
             http_port,
             data_dir,
             frontend_dir,
-            agent_base_url,
-            agent_certs_dir,
-            agent_socket_path,
-            agent_accept_invalid_hostnames,
+            agent_runtime_path,
             suite_id,
             suite_instance_id,
             engine_image,
@@ -93,14 +84,6 @@ fn env_string(name: &str, default_value: &str) -> String {
         .unwrap_or_else(|| default_value.to_string())
 }
 
-fn env_optional_path(name: &str) -> Option<PathBuf> {
-    std::env::var(name)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-}
-
 fn env_parse<T>(name: &str, default_value: T) -> T
 where
     T: std::str::FromStr + Copy,
@@ -108,16 +91,5 @@ where
     std::env::var(name)
         .ok()
         .and_then(|value| value.parse::<T>().ok())
-        .unwrap_or(default_value)
-}
-
-fn env_bool(name: &str, default_value: bool) -> bool {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => Some(true),
-            "0" | "false" | "no" | "off" => Some(false),
-            _ => None,
-        })
         .unwrap_or(default_value)
 }
