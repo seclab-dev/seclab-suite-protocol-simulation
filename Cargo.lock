@@ -1299,6 +1299,7 @@ dependencies = [
  "prost",
  "protocol-simulation-common",
  "reqwest",
+ "seclab-suite-runtime-sdk",
  "serde",
  "serde_json",
  "sqlx",
@@ -1663,6 +1664,19 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "seclab-suite-runtime-sdk"
+version = "0.1.0-alpha.1"
+source = "git+https://github.com/seclab-dev/seclab-suite-runtime-sdk.git?tag=rust-0.1.0-alpha.1#bd1e8dc6d146bac16286c6249e2a74d34f317c9d"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "uuid",
+]
 
 [[package]]
 name = "security-framework"

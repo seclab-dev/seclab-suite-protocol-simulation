@@ -1627,7 +1627,7 @@ const getFriendlyPcapFilename = (row: SimInstance) => {
 };
 
 /**
- * 流式下载指定仿真捕获的关联取证 PCAP 包数据，内置防目录穿透等安全机制。
+ * 按仿真实例下载关联取证 PCAP 包，由后端记录可信操作日志。
  * 下载成功后动态建立临时文件锚点链接，由浏览器拉起标准下载。
  * @param row 目标仿真运行实例
  */
@@ -1635,11 +1635,7 @@ const handleDownloadPcap = async (row: SimInstance) => {
   if (!row.pcapFilePath) return;
   isLoading.value = true;
   try {
-    const url = simulationApi.getPcapDownloadUrl(row.pcapFilePath);
-    const res = await fetch(url);
-    if (!res.ok) throw new Error("Download failed");
-
-    const blob = await res.blob();
+    const blob = await simulationApi.downloadPcap(row.instanceId);
     const friendlyFilename = getFriendlyPcapFilename(row);
 
     const blobUrl = window.URL.createObjectURL(blob);

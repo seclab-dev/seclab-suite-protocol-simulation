@@ -4,6 +4,9 @@ version = "0.1.0-alpha.1"
 edition.workspace = true
 
 [dependencies]
+protocol-simulation-common = { path = "../protocol-simulation-common" }
+seclab-suite-runtime-sdk.workspace = true
+
 anyhow.workspace = true
 axum.workspace = true
 base64.workspace = true
@@ -20,7 +23,6 @@ tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
-protocol-simulation-common = { path = "../protocol-simulation-common" }
 
 [dev-dependencies]
 tempfile = "3.23"

@@ -1,9 +1,9 @@
 use super::Config;
-use anyhow::{Context, bail};
-use reqwest::{Certificate, Identity};
+use anyhow::Context;
+use reqwest::Method;
+use seclab_suite_runtime::{OperationEvent, RuntimeClient};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::path::PathBuf;
 
 #[derive(Clone)]
 pub struct AgentClient {
@@ -101,48 +101,6 @@ pub struct WorkloadSummary {
     pub suite_instance_id: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AgentRuntimeDescriptor {
-    schema_version: u32,
-    suite_id: String,
-    instance_id: String,
-    endpoint: AgentRuntimeEndpoint,
-    credential: AgentRuntimeCredential,
-    capabilities: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(
-    tag = "kind",
-    rename_all = "lowercase",
-    rename_all_fields = "camelCase"
-)]
-enum AgentRuntimeEndpoint {
-    Unix {
-        socket_path: PathBuf,
-        base_url: String,
-    },
-    Https {
-        base_url: String,
-        ca_path: PathBuf,
-        client_cert_path: PathBuf,
-        client_key_path: PathBuf,
-    },
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AgentRuntimeCredential {
-    token_path: PathBuf,
-}
-
-struct RuntimeClient {
-    http: reqwest::Client,
-    base_url: String,
-    token: String,
-}
-
 impl AgentClient {
     pub fn new(config: Config) -> Self {
         Self { config }
@@ -153,33 +111,14 @@ impl AgentClient {
         payload: &StartWorkloadRequest,
     ) -> anyhow::Result<StartWorkloadResponse> {
         let runtime = self.runtime_client("workloads.manage").await?;
-        let url = runtime.url("/api/v1/agent/suite-runtime/workloads");
         let response = runtime
-            .http
-            .post(&url)
-            .bearer_auth(&runtime.token)
-            .json(payload)
-            .send()
+            .request(
+                Method::POST,
+                "/api/v1/agent/suite-runtime/workloads",
+                Some(payload),
+            )
             .await
-            .with_context(|| format!("Agent suite workload API not reachable: {url}"))?;
-        if response.status().as_u16() == 404 {
-            bail!("Agent suite workload API not found: {url}");
-        }
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            let error = serde_json::from_str::<AgentErrorEnvelope>(&text).ok();
-            return Err(anyhow::Error::new(AgentApiError {
-                status,
-                code: error.as_ref().and_then(|body| body.error_code.clone()),
-                message: error
-                    .as_ref()
-                    .map(|body| body.message.clone())
-                    .filter(|message| !message.is_empty())
-                    .unwrap_or_else(|| text.clone()),
-                detail: error.and_then(|body| body.data),
-            }));
-        }
+            .map_err(runtime_error)?;
         response
             .json::<StartWorkloadResponse>()
             .await
@@ -188,24 +127,14 @@ impl AgentClient {
 
     pub async fn stop_workload(&self, workload_id: &str) -> anyhow::Result<()> {
         let runtime = self.runtime_client("workloads.manage").await?;
-        let url = runtime.url(&format!(
-            "/api/v1/agent/suite-runtime/workloads/{workload_id}"
-        ));
-        let response = runtime
-            .http
-            .delete(&url)
-            .bearer_auth(&runtime.token)
-            .send()
+        runtime
+            .request::<serde_json::Value>(
+                Method::DELETE,
+                &format!("/api/v1/agent/suite-runtime/workloads/{workload_id}"),
+                None,
+            )
             .await
-            .with_context(|| format!("Agent suite workload API not reachable: {url}"))?;
-        if response.status().as_u16() == 404 {
-            bail!("Agent suite workload API not found: {url}");
-        }
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            bail!("Agent suite workload stop failed at {url}: {status}: {text}");
-        }
+            .map_err(runtime_error)?;
         Ok(())
     }
 
@@ -215,26 +144,15 @@ impl AgentClient {
         host_port: u16,
     ) -> anyhow::Result<StartPcapResponse> {
         let runtime = self.runtime_client("captures.manage").await?;
-        let url = runtime.url(&format!(
-            "/api/v1/agent/suite-runtime/workloads/{workload_id}/captures"
-        ));
         let payload = StartPcapRequest { host_port };
         let response = runtime
-            .http
-            .post(&url)
-            .bearer_auth(&runtime.token)
-            .json(&payload)
-            .send()
+            .request(
+                Method::POST,
+                &format!("/api/v1/agent/suite-runtime/workloads/{workload_id}/captures"),
+                Some(&payload),
+            )
             .await
-            .with_context(|| format!("Agent suite pcap API not reachable: {url}"))?;
-        if response.status().as_u16() == 404 {
-            bail!("Agent suite pcap API not found: {url}");
-        }
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            bail!("Agent suite pcap start failed at {url}: {status}: {text}");
-        }
+            .map_err(runtime_error)?;
         response
             .json::<StartPcapResponse>()
             .await
@@ -243,24 +161,16 @@ impl AgentClient {
 
     pub async fn stop_pcap(&self, workload_id: &str, capture_id: &str) -> anyhow::Result<Vec<u8>> {
         let runtime = self.runtime_client("captures.manage").await?;
-        let url = runtime.url(&format!(
-            "/api/v1/agent/suite-runtime/workloads/{workload_id}/captures/{capture_id}/finish"
-        ));
         let response = runtime
-            .http
-            .post(&url)
-            .bearer_auth(&runtime.token)
-            .send()
+            .request::<serde_json::Value>(
+                Method::POST,
+                &format!(
+                    "/api/v1/agent/suite-runtime/workloads/{workload_id}/captures/{capture_id}/finish"
+                ),
+                None,
+            )
             .await
-            .with_context(|| format!("Agent suite pcap API not reachable: {url}"))?;
-        if response.status().as_u16() == 404 {
-            bail!("Agent suite pcap API not found: {url}");
-        }
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            bail!("Agent suite pcap stop failed at {url}: {status}: {text}");
-        }
+            .map_err(runtime_error)?;
         Ok(response
             .bytes()
             .await
@@ -270,22 +180,14 @@ impl AgentClient {
 
     pub async fn list_workloads(&self) -> anyhow::Result<Vec<WorkloadSummary>> {
         let runtime = self.runtime_client("workloads.manage").await?;
-        let url = runtime.url("/api/v1/agent/suite-runtime/workloads");
         let response = runtime
-            .http
-            .get(&url)
-            .bearer_auth(&runtime.token)
-            .send()
+            .request::<serde_json::Value>(
+                Method::GET,
+                "/api/v1/agent/suite-runtime/workloads",
+                None,
+            )
             .await
-            .with_context(|| format!("Agent suite workload API not reachable: {url}"))?;
-        if response.status().as_u16() == 404 {
-            bail!("Agent suite workload API not found: {url}");
-        }
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            bail!("Agent suite workload list failed at {url}: {status}: {text}");
-        }
+            .map_err(runtime_error)?;
         response
             .json::<Vec<WorkloadSummary>>()
             .await
@@ -293,101 +195,45 @@ impl AgentClient {
     }
 
     async fn runtime_client(&self, capability: &str) -> anyhow::Result<RuntimeClient> {
-        let descriptor_text = tokio::fs::read_to_string(&self.config.agent_runtime_path)
+        RuntimeClient::from_path(&self.config.agent_runtime_path, capability)
             .await
-            .with_context(|| {
-                format!(
-                    "Agent runtime descriptor is missing: {}",
-                    self.config.agent_runtime_path.display()
-                )
-            })?;
-        let descriptor = serde_json::from_str::<AgentRuntimeDescriptor>(&descriptor_text)
-            .context("invalid Agent runtime descriptor")?;
-        if descriptor.schema_version != 1
-            || descriptor.suite_id != self.config.suite_id
-            || descriptor.instance_id != self.config.suite_instance_id
-        {
-            bail!("Agent runtime descriptor identity does not match suite instance");
-        }
-        if !descriptor
-            .capabilities
-            .iter()
-            .any(|value| value == capability)
-        {
-            bail!("Agent runtime capability is not granted: {capability}");
-        }
-        let token = tokio::fs::read_to_string(&descriptor.credential.token_path)
+            .map_err(anyhow::Error::from)
+    }
+
+    pub async fn submit_operation_event(&self, event: &OperationEvent) -> anyhow::Result<()> {
+        self.runtime_client("operation-logs.write")
+            .await?
+            .submit_operation_event(event)
             .await
-            .context("Agent runtime token is missing")?;
-        let token = token.trim().to_string();
-        if token.is_empty() {
-            bail!("Agent runtime token is empty");
-        }
-        let (http, base_url) = match descriptor.endpoint {
-            AgentRuntimeEndpoint::Unix {
-                socket_path,
-                base_url,
-            } => (
-                reqwest::Client::builder()
-                    .unix_socket(socket_path)
-                    .no_proxy()
-                    .build()
-                    .context("failed to build Agent UDS HTTP client")?,
-                base_url,
-            ),
-            AgentRuntimeEndpoint::Https {
-                base_url,
-                ca_path,
-                client_cert_path,
-                client_key_path,
-            } => {
-                let cert = tokio::fs::read(&client_cert_path)
-                    .await
-                    .context("Agent suite mTLS client certificate is missing")?;
-                let key = tokio::fs::read(&client_key_path)
-                    .await
-                    .context("Agent suite mTLS client key is missing")?;
-                let mut identity_pem = Vec::with_capacity(cert.len() + key.len() + 1);
-                identity_pem.extend_from_slice(&cert);
-                identity_pem.push(b'\n');
-                identity_pem.extend_from_slice(&key);
-                let identity = Identity::from_pem(&identity_pem)
-                    .context("failed to load Agent suite mTLS client identity")?;
-                let ca = tokio::fs::read(&ca_path)
-                    .await
-                    .context("Agent CA certificate is missing")?;
-                let http = reqwest::Client::builder()
-                    .identity(identity)
-                    .add_root_certificate(
-                        Certificate::from_pem(&ca)
-                            .context("failed to parse Agent CA certificate")?,
-                    )
-                    .build()
-                    .context("failed to build Agent mTLS HTTP client")?;
-                (http, base_url)
-            }
-        };
-        Ok(RuntimeClient {
-            http,
-            base_url: base_url.trim_end_matches('/').to_string(),
-            token,
-        })
+            .map_err(anyhow::Error::from)
     }
 }
 
-impl RuntimeClient {
-    fn url(&self, path: &str) -> String {
-        format!("{}{}", self.base_url, path)
-    }
+fn runtime_error(error: seclab_suite_runtime::Error) -> anyhow::Error {
+    let seclab_suite_runtime::Error::Agent { status, message } = error else {
+        return anyhow::Error::new(error);
+    };
+    let envelope = serde_json::from_str::<AgentErrorEnvelope>(&message).ok();
+    anyhow::Error::new(AgentApiError {
+        status: reqwest::StatusCode::from_u16(status)
+            .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+        code: envelope.as_ref().and_then(|body| body.error_code.clone()),
+        message: envelope
+            .as_ref()
+            .map(|body| body.message.clone())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(message),
+        detail: envelope.and_then(|body| body.data),
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentRuntimeDescriptor, AgentRuntimeEndpoint};
+    use seclab_suite_runtime::{RuntimeDescriptor, RuntimeEndpoint};
 
     #[test]
     fn runtime_descriptor_supports_unix_and_https_endpoints() {
-        let unix = serde_json::from_str::<AgentRuntimeDescriptor>(
+        let unix = serde_json::from_str::<RuntimeDescriptor>(
             r#"{
                 "schemaVersion": 1,
                 "suiteId": "suite.example",
@@ -402,9 +248,9 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert!(matches!(unix.endpoint, AgentRuntimeEndpoint::Unix { .. }));
+        assert!(matches!(unix.endpoint, RuntimeEndpoint::Unix { .. }));
 
-        let https = serde_json::from_str::<AgentRuntimeDescriptor>(
+        let https = serde_json::from_str::<RuntimeDescriptor>(
             r#"{
                 "schemaVersion": 1,
                 "suiteId": "suite.example",
@@ -421,6 +267,6 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert!(matches!(https.endpoint, AgentRuntimeEndpoint::Https { .. }));
+        assert!(matches!(https.endpoint, RuntimeEndpoint::Https { .. }));
     }
 }

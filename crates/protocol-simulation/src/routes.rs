@@ -6,10 +6,13 @@ use super::models::{
 };
 use super::rule_package;
 use axum::extract::{DefaultBodyLimit, Multipart, Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use seclab_suite_runtime::{
+    OperationEvent, OperationImpact, OperationOutcome, OperationTarget, ParameterValue,
+};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
@@ -39,7 +42,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/instances/{id}/pcap/start", post(start_pcap))
         .route("/api/instances/{id}/pcap/stop", post(stop_pcap))
         .route("/api/instances/{id}/pcap", delete(delete_pcap))
-        .route("/api/pcap/download/{file}", get(download_pcap))
+        .route("/api/instances/{id}/pcap/download", post(download_pcap))
         .route("/api/logs", get(list_logs))
         .route("/internal/events", post(record_event))
         .layer(DefaultBodyLimit::max(25 * 1024 * 1024));
@@ -69,8 +72,10 @@ async fn list_rules(State(state): State<Arc<AppState>>) -> ApiResult<impl IntoRe
 
 async fn create_rule(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(payload): Json<CreateRuleRequest>,
 ) -> ApiResult<impl IntoResponse> {
+    let operation_context = operation_context(&headers);
     validate_protocol(&payload.protocol)?;
     if payload.name.trim().is_empty() {
         return Err(ApiError::bad_request("rule name is required"));
@@ -87,6 +92,19 @@ async fn create_rule(
         &config_json,
     )
     .await?;
+    emit_operation_event(
+        &state,
+        operation_event(
+            "rule_created",
+            "创建仿真规则",
+            "Create simulation rule",
+            "simulation_rule",
+            &rule.id,
+            (OperationOutcome::Success, OperationImpact::Info),
+            operation_context.as_deref(),
+        ),
+    )
+    .await;
     Ok((
         StatusCode::CREATED,
         Json(ApiEnvelope {
@@ -98,12 +116,27 @@ async fn create_rule(
 
 async fn delete_rule(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
+    let operation_context = operation_context(&headers);
     let deleted = db::delete_rule(&state.db, &id).await?;
     if !deleted {
         return Err(ApiError::not_found("rule not found"));
     }
+    emit_operation_event(
+        &state,
+        operation_event(
+            "rule_deleted",
+            "删除仿真规则",
+            "Delete simulation rule",
+            "simulation_rule",
+            &id,
+            (OperationOutcome::Success, OperationImpact::Warning),
+            operation_context.as_deref(),
+        ),
+    )
+    .await;
     Ok(Json(ApiEnvelope {
         success: true,
         data: serde_json::json!({ "deleted": true }),
@@ -122,8 +155,10 @@ async fn get_current_rule_package(
 
 async fn import_rule_package(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     mut multipart: Multipart,
 ) -> ApiResult<impl IntoResponse> {
+    let operation_context = operation_context(&headers);
     let mut archive = None;
     while let Some(field) = multipart
         .next_field()
@@ -148,6 +183,25 @@ async fn import_rule_package(
         validate_protocol(&rule.protocol)?;
     }
     let summary = db::import_rule_package(&state.db, &package).await?;
+    emit_operation_event(
+        &state,
+        operation_event_builder(
+            "rule_package_imported",
+            "导入规则包",
+            "Import rule package",
+            "rule_package",
+            &summary.package_id,
+            (OperationOutcome::Success, OperationImpact::Warning),
+            operation_context.as_deref(),
+        )
+        .parameter(
+            "ruleCount",
+            ParameterValue::Number(summary.rule_count as f64),
+        )
+        .build()
+        .expect("static operation event must be valid"),
+    )
+    .await;
     Ok(Json(ApiEnvelope {
         success: true,
         data: summary,
@@ -164,8 +218,10 @@ async fn list_instances(State(state): State<Arc<AppState>>) -> ApiResult<impl In
 
 async fn deploy_instance(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(payload): Json<DeployInstanceRequest>,
 ) -> ApiResult<impl IntoResponse> {
+    let operation_context = operation_context(&headers);
     let Some(rule) = db::get_rule(&state.db, &payload.rule_id).await? else {
         return Err(ApiError::not_found("rule not found"));
     };
@@ -243,6 +299,22 @@ async fn deploy_instance(
                 .is_some_and(AgentApiError::is_port_unavailable) =>
         {
             db::delete_instance(&state.db, &instance_id).await?;
+            emit_operation_event(
+                &state,
+                operation_event_builder(
+                    "instance_deployed",
+                    "部署仿真实例",
+                    "Deploy simulation instance",
+                    "simulation_instance",
+                    &instance_id,
+                    (OperationOutcome::Failure, OperationImpact::Error),
+                    operation_context.as_deref(),
+                )
+                .error("PORT_UNAVAILABLE", "Requested host port is unavailable")
+                .build()
+                .expect("static operation event must be valid"),
+            )
+            .await;
             return Err(ApiError::conflict(format!(
                 "host port {} is unavailable on the target node",
                 payload.host_port
@@ -263,6 +335,29 @@ async fn deploy_instance(
         }
     }
 
+    let (outcome, impact) = if instance.status == "running" {
+        (OperationOutcome::Success, OperationImpact::Info)
+    } else {
+        (OperationOutcome::Failure, OperationImpact::Error)
+    };
+    let mut audit = operation_event_builder(
+        "instance_deployed",
+        "部署仿真实例",
+        "Deploy simulation instance",
+        "simulation_instance",
+        &instance_id,
+        (outcome, impact),
+        operation_context.as_deref(),
+    );
+    if instance.status != "running" {
+        audit = audit.error("INSTANCE_DEPLOY_FAILED", "Simulation deployment failed");
+    }
+    emit_operation_event(
+        &state,
+        audit.build().expect("static operation event must be valid"),
+    )
+    .await;
+
     Ok((
         StatusCode::CREATED,
         Json(ApiEnvelope {
@@ -274,8 +369,10 @@ async fn deploy_instance(
 
 async fn undeploy_instance(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
+    let operation_context = operation_context(&headers);
     let Some(instance) = db::get_instance(&state.db, &id).await? else {
         return Err(ApiError::not_found("instance not found"));
     };
@@ -291,6 +388,22 @@ async fn undeploy_instance(
             Some(&error_message),
         )
         .await?;
+        emit_operation_event(
+            &state,
+            operation_event_builder(
+                "instance_undeployed",
+                "撤销仿真实例",
+                "Undeploy simulation instance",
+                "simulation_instance",
+                &id,
+                (OperationOutcome::Failure, OperationImpact::Error),
+                operation_context.as_deref(),
+            )
+            .error("INSTANCE_UNDEPLOY_FAILED", "Simulation undeployment failed")
+            .build()
+            .expect("static operation event must be valid"),
+        )
+        .await;
         return Ok(Json(ApiEnvelope {
             success: true,
             data: updated.unwrap_or(instance),
@@ -298,6 +411,19 @@ async fn undeploy_instance(
     }
     let deleted = instance;
     db::delete_instance(&state.db, &id).await?;
+    emit_operation_event(
+        &state,
+        operation_event(
+            "instance_undeployed",
+            "撤销仿真实例",
+            "Undeploy simulation instance",
+            "simulation_instance",
+            &id,
+            (OperationOutcome::Success, OperationImpact::Warning),
+            operation_context.as_deref(),
+        ),
+    )
+    .await;
     Ok(Json(ApiEnvelope {
         success: true,
         data: deleted,
@@ -344,8 +470,10 @@ fn should_mark_instance_inactive(instance: &Instance, workload_ids: &HashSet<Str
 
 async fn start_pcap(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
+    let operation_context = operation_context(&headers);
     let Some(instance) = db::get_instance(&state.db, &id).await? else {
         return Err(ApiError::not_found("instance not found"));
     };
@@ -364,7 +492,28 @@ async fn start_pcap(
         .ok_or_else(|| ApiError::bad_request("instance workload is missing"))?;
     let host_port = u16::try_from(instance.host_port)
         .map_err(|_| ApiError::bad_request("invalid instance host port"))?;
-    let capture = state.agent.start_pcap(workload_id, host_port).await?;
+    let capture = match state.agent.start_pcap(workload_id, host_port).await {
+        Ok(capture) => capture,
+        Err(error) => {
+            emit_operation_event(
+                &state,
+                operation_event_builder(
+                    "capture_started",
+                    "开始抓包",
+                    "Start capture",
+                    "simulation_instance",
+                    &id,
+                    (OperationOutcome::Failure, OperationImpact::Error),
+                    operation_context.as_deref(),
+                )
+                .error("CAPTURE_START_FAILED", "Capture start failed")
+                .build()
+                .expect("static operation event must be valid"),
+            )
+            .await;
+            return Err(error.into());
+        }
+    };
     let started_at = chrono::Utc::now().timestamp();
     let updated = db::update_pcap_state(
         &state.db,
@@ -376,6 +525,19 @@ async fn start_pcap(
     )
     .await?
     .unwrap_or(instance);
+    emit_operation_event(
+        &state,
+        operation_event(
+            "capture_started",
+            "开始抓包",
+            "Start capture",
+            "simulation_instance",
+            &id,
+            (OperationOutcome::Success, OperationImpact::Info),
+            operation_context.as_deref(),
+        ),
+    )
+    .await;
     Ok(Json(ApiEnvelope {
         success: true,
         data: updated,
@@ -384,8 +546,10 @@ async fn start_pcap(
 
 async fn stop_pcap(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
+    let operation_context = operation_context(&headers);
     let Some(instance) = db::get_instance(&state.db, &id).await? else {
         return Err(ApiError::not_found("instance not found"));
     };
@@ -403,11 +567,45 @@ async fn stop_pcap(
         .pcap_capture_id
         .as_deref()
         .ok_or_else(|| ApiError::bad_request("pcap capture id is missing"))?;
-    let pcap_bytes = state.agent.stop_pcap(workload_id, capture_id).await?;
+    let pcap_bytes = match state.agent.stop_pcap(workload_id, capture_id).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            emit_operation_event(
+                &state,
+                operation_event_builder(
+                    "capture_stopped",
+                    "停止抓包",
+                    "Stop capture",
+                    "simulation_instance",
+                    &id,
+                    (OperationOutcome::Failure, OperationImpact::Error),
+                    operation_context.as_deref(),
+                )
+                .error("CAPTURE_STOP_FAILED", "Capture stop failed")
+                .build()
+                .expect("static operation event must be valid"),
+            )
+            .await;
+            return Err(error.into());
+        }
+    };
     if pcap_bytes.len() <= 24 {
         let updated = db::update_pcap_state(&state.db, &id, "idle", None, None, None)
             .await?
             .unwrap_or(instance);
+        emit_operation_event(
+            &state,
+            operation_event(
+                "capture_stopped",
+                "停止抓包",
+                "Stop capture",
+                "simulation_instance",
+                &id,
+                (OperationOutcome::Success, OperationImpact::Info),
+                operation_context.as_deref(),
+            ),
+        )
+        .await;
         return Ok(Json(ApiEnvelope {
             success: true,
             data: updated,
@@ -425,6 +623,19 @@ async fn stop_pcap(
     let updated = db::update_pcap_state(&state.db, &id, "ready", None, None, Some(&file_name))
         .await?
         .unwrap_or(instance);
+    emit_operation_event(
+        &state,
+        operation_event(
+            "capture_stopped",
+            "停止抓包",
+            "Stop capture",
+            "simulation_instance",
+            &id,
+            (OperationOutcome::Success, OperationImpact::Info),
+            operation_context.as_deref(),
+        ),
+    )
+    .await;
     Ok(Json(ApiEnvelope {
         success: true,
         data: updated,
@@ -433,8 +644,10 @@ async fn stop_pcap(
 
 async fn delete_pcap(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
+    let operation_context = operation_context(&headers);
     let Some(instance) = db::get_instance(&state.db, &id).await? else {
         return Err(ApiError::not_found("instance not found"));
     };
@@ -452,6 +665,19 @@ async fn delete_pcap(
     let updated = db::update_pcap_state(&state.db, &id, "idle", None, None, None)
         .await?
         .unwrap_or(instance);
+    emit_operation_event(
+        &state,
+        operation_event(
+            "capture_deleted",
+            "删除抓包",
+            "Delete capture",
+            "simulation_instance",
+            &id,
+            (OperationOutcome::Success, OperationImpact::Warning),
+            operation_context.as_deref(),
+        ),
+    )
+    .await;
     Ok(Json(ApiEnvelope {
         success: true,
         data: updated,
@@ -460,21 +686,103 @@ async fn delete_pcap(
 
 async fn download_pcap(
     State(state): State<Arc<AppState>>,
-    Path(file): Path<String>,
-) -> ApiResult<impl IntoResponse> {
-    if file.contains('/') || file.contains('\\') || file == "." || file == ".." {
-        return Err(ApiError::bad_request("invalid pcap file path"));
-    }
-    let bytes = tokio::fs::read(state.config.data_dir.join("pcap").join(&file))
-        .await
-        .map_err(|_| ApiError::not_found("pcap file not found"))?;
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    let operation_context = operation_context(&headers);
+    let instance = match db::get_instance(&state.db, &id).await {
+        Ok(Some(instance)) => instance,
+        Ok(None) => {
+            emit_capture_download_failure(
+                &state,
+                &id,
+                operation_context.as_deref(),
+                "INSTANCE_NOT_FOUND",
+                "Simulation instance not found",
+            )
+            .await;
+            return Err(ApiError::not_found("instance not found"));
+        }
+        Err(error) => {
+            emit_capture_download_failure(
+                &state,
+                &id,
+                operation_context.as_deref(),
+                "INSTANCE_READ_FAILED",
+                "Simulation instance lookup failed",
+            )
+            .await;
+            return Err(error.into());
+        }
+    };
+    let Some(file) = instance.pcap_file_path.as_deref() else {
+        emit_capture_download_failure(
+            &state,
+            &id,
+            operation_context.as_deref(),
+            "CAPTURE_NOT_READY",
+            "Capture is not ready for download",
+        )
+        .await;
+        return Err(ApiError::not_found("pcap file not found"));
+    };
+    let bytes = match tokio::fs::read(state.config.data_dir.join("pcap").join(file)).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            emit_capture_download_failure(
+                &state,
+                &id,
+                operation_context.as_deref(),
+                "CAPTURE_READ_FAILED",
+                "Capture file could not be read",
+            )
+            .await;
+            return Err(ApiError::not_found("pcap file not found"));
+        }
+    };
+    emit_operation_event(
+        &state,
+        operation_event(
+            "capture_downloaded",
+            "下载抓包",
+            "Download capture",
+            "simulation_instance",
+            &id,
+            (OperationOutcome::Success, OperationImpact::Info),
+            operation_context.as_deref(),
+        ),
+    )
+    .await;
     Ok((
         [
             ("content-type", "application/vnd.tcpdump.pcap"),
             ("content-disposition", "attachment"),
         ],
         bytes,
-    ))
+    )
+        .into_response())
+}
+
+async fn emit_capture_download_failure(
+    state: &AppState,
+    instance_id: &str,
+    operation_context_id: Option<&str>,
+    error_code: &str,
+    error_summary: &str,
+) {
+    let event = operation_event_builder(
+        "capture_downloaded",
+        "下载抓包",
+        "Download capture",
+        "simulation_instance",
+        instance_id,
+        (OperationOutcome::Failure, OperationImpact::Error),
+        operation_context_id,
+    )
+    .error(error_code, error_summary)
+    .build()
+    .expect("static operation event must be valid");
+    emit_operation_event(state, event).await;
 }
 
 async fn list_logs(State(state): State<Arc<AppState>>) -> ApiResult<impl IntoResponse> {
@@ -509,6 +817,64 @@ fn validate_protocol(protocol: &str) -> ApiResult<()> {
         Err(ApiError::bad_request(format!(
             "unsupported simulation protocol: {protocol}"
         )))
+    }
+}
+
+fn operation_event(
+    code: &str,
+    zh_cn: &str,
+    en_us: &str,
+    target_kind: &str,
+    target_id: &str,
+    result: (OperationOutcome, OperationImpact),
+    operation_context_id: Option<&str>,
+) -> OperationEvent {
+    operation_event_builder(
+        code,
+        zh_cn,
+        en_us,
+        target_kind,
+        target_id,
+        result,
+        operation_context_id,
+    )
+    .build()
+    .expect("static operation event must be valid")
+}
+
+fn operation_event_builder(
+    code: &str,
+    zh_cn: &str,
+    en_us: &str,
+    target_kind: &str,
+    target_id: &str,
+    result: (OperationOutcome, OperationImpact),
+    operation_context_id: Option<&str>,
+) -> seclab_suite_runtime::OperationEventBuilder {
+    let builder =
+        OperationEvent::builder(code, zh_cn, en_us, result.0, result.1).target(OperationTarget {
+            kind: target_kind.to_string(),
+            id: target_id.to_string(),
+            display_name: None,
+            ownership: None,
+        });
+    match operation_context_id {
+        Some(value) => builder.operation_context_id(value),
+        None => builder,
+    }
+}
+
+fn operation_context(headers: &HeaderMap) -> Option<String> {
+    seclab_suite_runtime::operation_context_from_header(
+        headers
+            .get(seclab_suite_runtime::OPERATION_CONTEXT_HEADER)
+            .and_then(|value| value.to_str().ok()),
+    )
+}
+
+async fn emit_operation_event(state: &AppState, event: OperationEvent) {
+    if let Err(error) = state.agent.submit_operation_event(&event).await {
+        tracing::error!(event_id = %event.event_id, %error, "operation audit event was not accepted");
     }
 }
 
@@ -564,5 +930,51 @@ impl IntoResponse for ApiError {
             }),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn operation_event_contains_only_trusted_semantic_fields() {
+        let event = operation_event(
+            "instance_deployed",
+            "部署仿真实例",
+            "Deploy simulation instance",
+            "simulation_instance",
+            "sim-1",
+            (OperationOutcome::Success, OperationImpact::Info),
+            Some("context-1"),
+        );
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["eventCode"], "instance_deployed");
+        assert_eq!(value["operationContextId"], "context-1");
+        assert_eq!(value["target"]["id"], "sim-1");
+        assert!(value.get("actor").is_none());
+        assert!(value.get("module").is_none());
+    }
+
+    #[test]
+    fn capture_download_event_targets_instance_without_task_id_or_file_path() {
+        let event = operation_event(
+            "capture_downloaded",
+            "下载抓包",
+            "Download capture",
+            "simulation_instance",
+            "sim-1",
+            (OperationOutcome::Success, OperationImpact::Info),
+            Some("context-1"),
+        );
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["eventCode"], "capture_downloaded");
+        assert_eq!(value["target"]["id"], "sim-1");
+        assert!(value["taskId"].is_null());
+        assert!(
+            value["parameters"]
+                .as_object()
+                .is_some_and(|value| value.is_empty())
+        );
     }
 }

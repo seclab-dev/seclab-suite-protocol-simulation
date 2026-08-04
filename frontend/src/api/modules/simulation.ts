@@ -403,10 +403,7 @@ export const simulationApi = {
         }
       : fail<SimInstance[]>(res);
   },
-  async listLogs(params?: {
-    page?: number;
-    pageSize?: number;
-  }): Promise<
+  async listLogs(params?: { page?: number; pageSize?: number }): Promise<
     ApiEnvelope<{
       total: number;
       page: number;
@@ -462,9 +459,13 @@ export const simulationApi = {
       ? { success: true, data: mapInstance(res.data) }
       : fail<SimInstance>(res);
   },
-  getPcapDownloadUrl: (pcapFilePath?: string) =>
-    pcapFilePath
-      ? apiUrl(`/api/pcap/download/${encodeURIComponent(pcapFilePath)}`)
-      : "",
+  async downloadPcap(instanceId: string): Promise<Blob> {
+    const res = await fetch(
+      apiUrl(`/api/instances/${encodeURIComponent(instanceId)}/pcap/download`),
+      { method: "POST" },
+    );
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.blob();
+  },
   getCallbackUrl: () => apiUrl("/internal/events"),
 };

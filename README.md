@@ -55,3 +55,5 @@ API 服务默认监听 `8080`，数据目录为 `/data`，可通过 `SECLAB_SUIT
 规则包导入、实例部署、下线和取证接口由套件 API 提供；主控只负责安装套件、代理入口、注入运行配置和展示统一通知。
 
 SecLab 会把 `/run/seclab-agent/runtime.json` 及实例令牌以只读方式注入套件。套件 API 根据描述自动连接本地 UDS 或节点 mTLS HTTPS，不读取 Agent mode，也不接受客户端自行指定套件实例身份。
+
+套件后端通过 Suite Runtime SDK 使用 `operation-logs.write` 能力记录规则、仿真实例和抓包生命周期；查询、下载、进度和内部引擎事件不进入平台操作日志。
