@@ -291,7 +291,10 @@ const en = {
   },
   notification: {
     title: {
+      success: "Success",
+      error: "Error",
       warning: "Warning",
+      info: "Information",
     },
   },
 };

@@ -274,7 +274,10 @@ const zh: typeof en = {
   },
   notification: {
     title: {
+      success: "成功",
+      error: "错误",
       warning: "警告",
+      info: "提示",
     },
   },
 };
