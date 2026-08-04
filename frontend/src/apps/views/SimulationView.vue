@@ -508,15 +508,6 @@ const loadNodeInstancesAndLogs = async (silent = false) => {
   }
 };
 
-const showDeploymentsAfterMutation = async () => {
-  selectedNodeId.value = "local";
-  if (activeTab.value === "deployments") {
-    await loadNodeInstancesAndLogs();
-    return;
-  }
-  activeTab.value = "deployments";
-};
-
 watch(activeTab, (tab) => {
   if (tab === "rules") {
     void loadCurrentPackage();
@@ -1336,7 +1327,6 @@ const executeDeploy = async () => {
           }),
       );
       isDeployDialogOpen.value = false;
-      await showDeploymentsAfterMutation();
     } else if (res.success) {
       notificationStore.success(
         t("app.simulation.deployments.messages.deploySuccess", {
@@ -1344,7 +1334,6 @@ const executeDeploy = async () => {
         }),
       );
       isDeployDialogOpen.value = false;
-      await showDeploymentsAfterMutation();
     } else {
       const message =
         res.messageKey === "app.simulation.deployments.messages.portOccupied"
