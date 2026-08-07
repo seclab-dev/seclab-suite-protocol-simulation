@@ -17,7 +17,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
-use tower_http::trace::TraceLayer;
+use tower_http::trace::{DefaultMakeSpan, TraceLayer};
+use tracing::Level;
 use uuid::Uuid;
 
 type ApiResult<T> = Result<T, ApiError>;
@@ -27,6 +28,7 @@ struct ApiError {
     status: StatusCode,
     message: String,
     message_key: Option<String>,
+    cause: Option<anyhow::Error>,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -54,7 +56,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(api)
         .fallback_service(frontend)
         .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                .on_failure(()),
+        )
         .with_state(state)
 }
 
@@ -884,6 +890,7 @@ impl ApiError {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
             message_key: None,
+            cause: None,
         }
     }
 
@@ -892,6 +899,7 @@ impl ApiError {
             status: StatusCode::NOT_FOUND,
             message: message.into(),
             message_key: None,
+            cause: None,
         }
     }
 
@@ -900,6 +908,7 @@ impl ApiError {
             status: StatusCode::CONFLICT,
             message: message.into(),
             message_key: None,
+            cause: None,
         }
     }
 
@@ -911,16 +920,26 @@ impl ApiError {
 
 impl From<anyhow::Error> for ApiError {
     fn from(value: anyhow::Error) -> Self {
+        let message = value.to_string();
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: value.to_string(),
+            message,
             message_key: None,
+            cause: Some(value),
         }
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if self.status.is_server_error() {
+            tracing::error!(
+                status = %self.status,
+                message = %self.message,
+                error = %error_detail(self.cause.as_ref(), &self.message),
+                "HTTP request handling failed"
+            );
+        }
         (
             self.status,
             Json(ErrorEnvelope {
@@ -933,9 +952,43 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// 生成用于服务端日志的完整错误链，同时为无底层错误的 500 保留可诊断消息。
+fn error_detail(cause: Option<&anyhow::Error>, message: &str) -> String {
+    cause
+        .map(|error| format!("{error:#}"))
+        .unwrap_or_else(|| message.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn internal_error_detail_contains_complete_error_chain() {
+        let error = anyhow::anyhow!("database is locked").context("failed to list rules");
+        let detail = error_detail(Some(&error), "fallback");
+
+        assert!(detail.contains("failed to list rules"));
+        assert!(detail.contains("database is locked"));
+    }
+
+    #[tokio::test]
+    async fn internal_error_response_keeps_existing_envelope() {
+        let response = ApiError::from(anyhow::anyhow!("database unavailable")).into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "success": false,
+                "message": "database unavailable"
+            })
+        );
+    }
 
     #[test]
     fn operation_event_contains_only_trusted_semantic_fields() {
