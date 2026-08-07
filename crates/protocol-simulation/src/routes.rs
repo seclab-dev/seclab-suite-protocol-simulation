@@ -803,7 +803,7 @@ async fn record_event(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<EventRequest>,
 ) -> ApiResult<impl IntoResponse> {
-    let log = db::insert_log(&state.db, &payload).await?;
+    let log = state.audit_logs.write(payload).await?;
     Ok((
         StatusCode::CREATED,
         Json(ApiEnvelope {

@@ -9,8 +9,10 @@ pub use routes::router;
 use anyhow::Context;
 use protocol_simulation_common::DEFAULT_EVENT_CALLBACK_URL;
 use sqlx::SqlitePool;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -28,6 +30,7 @@ pub struct Config {
 pub struct AppState {
     pub config: Config,
     pub db: SqlitePool,
+    pub audit_logs: db::AuditLogWriter,
     pub agent: agent::AgentClient,
 }
 
@@ -67,13 +70,27 @@ impl AppState {
             .await
             .with_context(|| format!("failed to create data dir {}", config.data_dir.display()))?;
         let db_path = config.data_dir.join("protocol-simulation.db");
-        let db_url = format!("sqlite://{}?mode=rwc", db_path.display());
-        let db = SqlitePool::connect(&db_url)
+        let connect_options = SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .busy_timeout(Duration::from_secs(10));
+        let db = SqlitePoolOptions::new()
+            .max_connections(8)
+            .acquire_timeout(Duration::from_secs(5))
+            .connect_with(connect_options)
             .await
             .with_context(|| format!("failed to open sqlite database {}", db_path.display()))?;
         db::init(&db).await?;
+        let audit_logs = db::AuditLogWriter::start(db.clone());
         let agent = agent::AgentClient::new(config.clone());
-        Ok(Arc::new(Self { config, db, agent }))
+        Ok(Arc::new(Self {
+            config,
+            db,
+            audit_logs,
+            agent,
+        }))
     }
 }
 
@@ -92,4 +109,32 @@ where
         .ok()
         .and_then(|value| value.parse::<T>().ok())
         .unwrap_or(default_value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn initialize_enables_wal_journal_mode() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            http_port: 8080,
+            data_dir: data_dir.path().to_path_buf(),
+            frontend_dir: data_dir.path().to_path_buf(),
+            agent_runtime_path: data_dir.path().join("runtime.json"),
+            suite_id: "seclab.protocol-simulation".to_string(),
+            suite_instance_id: "instance-1".to_string(),
+            engine_image: "protocol-simulation-engine:test".to_string(),
+            event_callback_url: DEFAULT_EVENT_CALLBACK_URL.to_string(),
+        };
+
+        let state = AppState::initialize(config).await.unwrap();
+        let journal_mode = sqlx::query_scalar::<_, String>("PRAGMA journal_mode")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+
+        assert_eq!(journal_mode, "wal");
+    }
 }

@@ -1,7 +1,76 @@
 use super::models::{AuditLog, EventRequest, Instance, Rule, RulePackageSummary};
 use super::rule_package::ImportedRulePackage;
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use sqlx::SqlitePool;
+use tokio::sync::{mpsc, oneshot};
+
+const AUDIT_LOG_QUEUE_CAPACITY: usize = 4_096;
+const AUDIT_LOG_BATCH_SIZE: usize = 128;
+
+/// 将并发审计事件串行化并按批次写入 SQLite。
+#[derive(Clone)]
+pub struct AuditLogWriter {
+    sender: mpsc::Sender<AuditLogWriteRequest>,
+}
+
+struct AuditLogWriteRequest {
+    event: EventRequest,
+    response: oneshot::Sender<anyhow::Result<AuditLog>>,
+}
+
+impl AuditLogWriter {
+    /// 启动单写者后台任务，避免多个 SQLite 连接竞争写锁。
+    pub fn start(db: SqlitePool) -> Self {
+        let (sender, receiver) = mpsc::channel(AUDIT_LOG_QUEUE_CAPACITY);
+        tokio::spawn(run_audit_log_writer(db, receiver));
+        Self { sender }
+    }
+
+    /// 将一条审计事件加入有界队列并等待事务提交结果。
+    pub async fn write(&self, event: EventRequest) -> anyhow::Result<AuditLog> {
+        let (response, result) = oneshot::channel();
+        self.sender
+            .send(AuditLogWriteRequest { event, response })
+            .await
+            .map_err(|_| anyhow!("audit log writer is unavailable"))?;
+        result
+            .await
+            .context("audit log writer stopped before returning a result")?
+    }
+}
+
+/// 持续收集当前已排队事件，并以有限批次提交到数据库。
+async fn run_audit_log_writer(db: SqlitePool, mut receiver: mpsc::Receiver<AuditLogWriteRequest>) {
+    while let Some(first) = receiver.recv().await {
+        let mut requests = Vec::with_capacity(AUDIT_LOG_BATCH_SIZE);
+        requests.push(first);
+        while requests.len() < AUDIT_LOG_BATCH_SIZE {
+            match receiver.try_recv() {
+                Ok(request) => requests.push(request),
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+
+        let events = requests
+            .iter()
+            .map(|request| &request.event)
+            .collect::<Vec<_>>();
+        match insert_log_batch(&db, &events).await {
+            Ok(logs) => {
+                for (request, log) in requests.into_iter().zip(logs) {
+                    let _ = request.response.send(Ok(log));
+                }
+            }
+            Err(error) => {
+                let detail = format!("{error:#}");
+                for request in requests {
+                    let _ = request.response.send(Err(anyhow!(detail.clone())));
+                }
+            }
+        }
+    }
+}
 
 pub async fn init(db: &SqlitePool) -> anyhow::Result<()> {
     sqlx::query(
@@ -387,45 +456,50 @@ pub async fn update_pcap_state(
     get_instance(db, id).await
 }
 
-pub async fn insert_log(db: &SqlitePool, event: &EventRequest) -> anyhow::Result<AuditLog> {
-    let timestamp = event
-        .timestamp
-        .clone()
-        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
-    let result = sqlx::query(
-        r#"
-        INSERT INTO audit_logs (
-            instance_id, rule_id, protocol, event_type, summary,
-            client_ip, client_port, payload_hex, timestamp
+async fn insert_log_batch(
+    db: &SqlitePool,
+    events: &[&EventRequest],
+) -> anyhow::Result<Vec<AuditLog>> {
+    let mut transaction = db
+        .begin()
+        .await
+        .context("failed to begin audit log batch")?;
+    let mut logs = Vec::with_capacity(events.len());
+    for event in events {
+        let timestamp = event
+            .timestamp
+            .clone()
+            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+        let log = sqlx::query_as::<_, AuditLog>(
+            r#"
+            INSERT INTO audit_logs (
+                instance_id, rule_id, protocol, event_type, summary,
+                client_ip, client_port, payload_hex, timestamp
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            RETURNING id, instance_id, rule_id, protocol, event_type, summary,
+                      client_ip, client_port, payload_hex, timestamp
+            "#,
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-        "#,
-    )
-    .bind(&event.instance_id)
-    .bind(&event.rule_id)
-    .bind(&event.protocol)
-    .bind(&event.event_type)
-    .bind(&event.summary)
-    .bind(&event.client_ip)
-    .bind(i64::from(event.client_port))
-    .bind(&event.payload_hex)
-    .bind(timestamp)
-    .execute(db)
-    .await
-    .context("failed to insert audit log")?;
-    let id = result.last_insert_rowid();
-    sqlx::query_as::<_, AuditLog>(
-        r#"
-        SELECT id, instance_id, rule_id, protocol, event_type, summary,
-               client_ip, client_port, payload_hex, timestamp
-          FROM audit_logs
-         WHERE id = ?1
-        "#,
-    )
-    .bind(id)
-    .fetch_one(db)
-    .await
-    .context("failed to fetch inserted audit log")
+        .bind(&event.instance_id)
+        .bind(&event.rule_id)
+        .bind(&event.protocol)
+        .bind(&event.event_type)
+        .bind(&event.summary)
+        .bind(&event.client_ip)
+        .bind(i64::from(event.client_port))
+        .bind(&event.payload_hex)
+        .bind(timestamp)
+        .fetch_one(&mut *transaction)
+        .await
+        .context("failed to insert audit log")?;
+        logs.push(log);
+    }
+    transaction
+        .commit()
+        .await
+        .context("failed to commit audit log batch")?;
+    Ok(logs)
 }
 
 pub async fn list_logs(db: &SqlitePool) -> anyhow::Result<Vec<AuditLog>> {
@@ -468,6 +542,20 @@ async fn ensure_column(
 mod tests {
     use super::*;
 
+    fn event(index: usize) -> EventRequest {
+        EventRequest {
+            instance_id: format!("instance-{index}"),
+            rule_id: "rule-1".to_string(),
+            protocol: "http".to_string(),
+            event_type: "connection".to_string(),
+            summary: format!("event {index}"),
+            client_ip: "192.0.2.1".to_string(),
+            client_port: 12_345,
+            payload_hex: None,
+            timestamp: None,
+        }
+    }
+
     fn instance(id: &str, port: i64) -> Instance {
         Instance {
             id: id.to_string(),
@@ -494,6 +582,28 @@ mod tests {
         init(&db).await.unwrap();
         let rules = list_rules(&db).await.unwrap();
         assert!(rules.is_empty());
+    }
+
+    #[tokio::test]
+    async fn audit_log_writer_serializes_concurrent_events() {
+        let db = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        init(&db).await.unwrap();
+        let writer = AuditLogWriter::start(db.clone());
+        let mut writes = tokio::task::JoinSet::new();
+
+        for index in 0..256 {
+            let writer = writer.clone();
+            writes.spawn(async move { writer.write(event(index)).await });
+        }
+        while let Some(result) = writes.join_next().await {
+            result.unwrap().unwrap();
+        }
+
+        let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM audit_logs")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(count, 256);
     }
 
     #[tokio::test]
