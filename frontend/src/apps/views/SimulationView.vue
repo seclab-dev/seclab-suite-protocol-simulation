@@ -107,8 +107,17 @@ const customRuleProtocolCapabilities = computed(() =>
 /** 规则列表分页：当前页码 */
 const rulesCurrentPage = ref(1);
 
-/** 规则列表分页：单页条数限制 */
+/** 规则列表分页：根据表格可用高度动态计算的单页条数 */
 const rulesPageSize = ref(10);
+
+/** 规则表格可用区域，用于监听窗口与应用布局变化。 */
+const rulesTableRegionRef = ref<HTMLElement | null>(null);
+
+const RULES_PAGE_SIZE_MIN = 1;
+const RULES_PAGE_SIZE_MAX = 100;
+const RULES_TABLE_BORDER_HEIGHT = 2;
+let rulesTableResizeObserver: ResizeObserver | null = null;
+let rulesPageSizeFrame: number | null = null;
 
 /** 规则整编筛选检索条件 */
 const rulesFilter = ref({
@@ -184,6 +193,84 @@ const pagedRules = computed(() => {
   const start = (rulesCurrentPage.value - 1) * rulesPageSize.value;
   return filteredRules.value.slice(start, start + rulesPageSize.value);
 });
+
+/**
+ * 根据规则表格的实际表头、数据行与可用区域高度更新单页条数。
+ * 调整容量时保留原分页首条规则所在的位置，避免窗口缩放导致跳页。
+ */
+const updateRulesPageSize = () => {
+  rulesPageSizeFrame = null;
+  const region = rulesTableRegionRef.value;
+  if (!region || activeTab.value !== "rules") return;
+
+  const headerRow = region.querySelector<HTMLElement>(".sl-table-header-row");
+  const dataRow = region.querySelector<HTMLElement>(".sl-table-row");
+  if (!headerRow || !dataRow) return;
+
+  const availableHeight = region.clientHeight;
+  const headerHeight = headerRow.getBoundingClientRect().height;
+  const rowHeight = dataRow.getBoundingClientRect().height;
+  if (availableHeight <= 0 || headerHeight <= 0 || rowHeight <= 0) return;
+
+  const availableRowsHeight = Math.max(
+    0,
+    availableHeight - headerHeight - RULES_TABLE_BORDER_HEIGHT,
+  );
+  const nextPageSize = Math.min(
+    RULES_PAGE_SIZE_MAX,
+    Math.max(RULES_PAGE_SIZE_MIN, Math.floor(availableRowsHeight / rowHeight)),
+  );
+  if (nextPageSize === rulesPageSize.value) return;
+
+  const firstRuleIndex = (rulesCurrentPage.value - 1) * rulesPageSize.value;
+  rulesPageSize.value = nextPageSize;
+  const nextTotalPages = Math.max(
+    1,
+    Math.ceil(filteredRules.value.length / nextPageSize),
+  );
+  rulesCurrentPage.value = Math.min(
+    nextTotalPages,
+    Math.floor(firstRuleIndex / nextPageSize) + 1,
+  );
+};
+
+/** 将同一渲染帧内的多次布局变化合并为一次分页容量计算。 */
+const scheduleRulesPageSizeUpdate = () => {
+  if (rulesPageSizeFrame !== null) {
+    cancelAnimationFrame(rulesPageSizeFrame);
+  }
+  rulesPageSizeFrame = requestAnimationFrame(updateRulesPageSize);
+};
+
+watch(
+  rulesTableRegionRef,
+  (region) => {
+    rulesTableResizeObserver?.disconnect();
+    rulesTableResizeObserver = null;
+
+    if (!region) return;
+    if (typeof ResizeObserver !== "undefined") {
+      rulesTableResizeObserver = new ResizeObserver(
+        scheduleRulesPageSizeUpdate,
+      );
+      rulesTableResizeObserver.observe(region);
+    }
+    scheduleRulesPageSizeUpdate();
+  },
+  { flush: "post" },
+);
+
+watch(
+  () => filteredRules.value.length,
+  () => {
+    rulesCurrentPage.value = Math.min(
+      rulesCurrentPage.value,
+      rulesTotalPages.value,
+    );
+    scheduleRulesPageSizeUpdate();
+  },
+  { flush: "post" },
+);
 
 // 监听筛选条件变化，自动重置分页至第一页，避免在空页面滞留
 watch(
@@ -442,6 +529,7 @@ watch(activeTab, (tab) => {
   if (tab === "rules") {
     void loadCurrentPackage();
     void loadRules();
+    scheduleRulesPageSizeUpdate();
   } else if (tab === "deployments") {
     void loadNodes();
     void loadNodeInstances();
@@ -681,6 +769,10 @@ onMounted(() => {
 onUnmounted(() => {
   registerConfirmationHandler(null);
   resolveConfirmation(false);
+  rulesTableResizeObserver?.disconnect();
+  if (rulesPageSizeFrame !== null) {
+    cancelAnimationFrame(rulesPageSizeFrame);
+  }
   if (timerId) {
     clearInterval(timerId);
   }
@@ -1858,7 +1950,10 @@ const handleDownloadPcap = async (row: SimInstance) => {
         </div>
 
         <div class="main-panel card-bg flex-column flex-1" data-slot="content">
-          <div class="table-body-region flex-1 overflow-auto">
+          <div
+            ref="rulesTableRegionRef"
+            class="table-body-region flex-1 overflow-auto"
+          >
             <SecLabTable
               :data="pagedRules"
               :columns="extendedRuleColumns"
@@ -1869,7 +1964,13 @@ const handleDownloadPcap = async (row: SimInstance) => {
                 {{ (rulesCurrentPage - 1) * rulesPageSize + index + 1 }}
               </template>
               <template #name="{ row }">
-                {{ getRuleName(row) }}
+                <SecLabTooltip
+                  class="rule-name-tooltip"
+                  :text="getRuleName(row)"
+                  position="top"
+                >
+                  <span class="rule-table-name">{{ getRuleName(row) }}</span>
+                </SecLabTooltip>
               </template>
               <template #cve="{ row }">
                 <span class="mono" v-if="row.cve">{{ row.cve }}</span>
@@ -2770,6 +2871,27 @@ const handleDownloadPcap = async (row: SimInstance) => {
 
 .table-body-region {
   position: relative;
+}
+
+:deep([data-ui="sim-rules-table"] .sl-table) {
+  table-layout: fixed;
+}
+
+:deep([data-ui="sim-rules-table"] .sl-table-cell .sl-cell) {
+  white-space: nowrap;
+}
+
+.rule-name-tooltip,
+.rule-table-name {
+  display: block;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.rule-table-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .panel-header {
