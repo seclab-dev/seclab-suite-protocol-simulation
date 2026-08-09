@@ -2,10 +2,11 @@ use super::AppState;
 use super::agent::{AgentApiError, StartWorkloadRequest, WorkloadPort, WorkloadResources};
 use super::db;
 use super::models::{
-    ApiEnvelope, CreateRuleRequest, DeployInstanceRequest, ErrorEnvelope, EventRequest, Instance,
+    ApiEnvelope, AuditLogPage, CreateRuleRequest, DeployInstanceRequest, ErrorEnvelope,
+    EventRequest, Instance,
 };
 use super::rule_package;
-use axum::extract::{DefaultBodyLimit, Multipart, Path, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -45,7 +46,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/instances/{id}/pcap/stop", post(stop_pcap))
         .route("/api/instances/{id}/pcap", delete(delete_pcap))
         .route("/api/instances/{id}/pcap/download", post(download_pcap))
-        .route("/api/logs", get(list_logs))
+        .route("/api/instances/{id}/audit-logs", get(list_instance_logs))
         .route("/internal/events", post(record_event))
         .layer(DefaultBodyLimit::max(25 * 1024 * 1024));
 
@@ -791,11 +792,47 @@ async fn emit_capture_download_failure(
     emit_operation_event(state, event).await;
 }
 
-async fn list_logs(State(state): State<Arc<AppState>>) -> ApiResult<impl IntoResponse> {
-    let logs = db::list_logs(&state.db).await?;
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuditLogQuery {
+    #[serde(default = "default_audit_log_page")]
+    page: u32,
+    #[serde(default = "default_audit_log_page_size")]
+    page_size: u32,
+}
+
+fn default_audit_log_page() -> u32 {
+    1
+}
+
+fn default_audit_log_page_size() -> u32 {
+    50
+}
+
+async fn list_instance_logs(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(query): Query<AuditLogQuery>,
+) -> ApiResult<impl IntoResponse> {
+    if query.page == 0 {
+        return Err(ApiError::bad_request("page must be greater than zero"));
+    }
+    if query.page_size == 0 || query.page_size > 200 {
+        return Err(ApiError::bad_request("pageSize must be between 1 and 200"));
+    }
+    if db::get_instance(&state.db, &id).await?.is_none() {
+        return Err(ApiError::not_found("simulation instance not found"));
+    }
+    let (total, records) =
+        db::list_instance_logs(&state.db, &id, query.page, query.page_size).await?;
     Ok(Json(ApiEnvelope {
         success: true,
-        data: logs,
+        data: AuditLogPage {
+            total,
+            page: query.page,
+            page_size: query.page_size,
+            records,
+        },
     }))
 }
 
@@ -803,7 +840,13 @@ async fn record_event(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<EventRequest>,
 ) -> ApiResult<impl IntoResponse> {
-    let log = state.audit_logs.write(payload).await?;
+    let log = match state.audit_logs.write(payload).await {
+        Ok(log) => log,
+        Err(db::AuditLogWriteError::InstanceNotFound) => {
+            return Err(ApiError::not_found("simulation instance not found"));
+        }
+        Err(db::AuditLogWriteError::Internal(error)) => return Err(error.into()),
+    };
     Ok((
         StatusCode::CREATED,
         Json(ApiEnvelope {

@@ -13,6 +13,7 @@ import {
   SecLabModal,
   SecLabTooltip,
   SecLabCheckbox,
+  SecLabActionMenu,
 } from "@/components/ui";
 import type { SecLabTableColumn } from "@seclab-dev/vue";
 import {
@@ -21,7 +22,6 @@ import {
   SIMULATION_PROTOCOL_OPTIONS,
   type SimRule,
   type SimInstance,
-  type SimLog,
   type SimRulePackage,
   type SimulationProtocolCapability,
   type SimulationProtocol,
@@ -35,6 +35,7 @@ import {
 } from "@/stores/confirmation-modal";
 import { notifyHost } from "@/suite-bridge";
 import SimulationRuleDetailDialog from "./simulation/SimulationRuleDetailDialog.vue";
+import InstanceAuditDialog from "./simulation/InstanceAuditDialog.vue";
 
 defineProps<{
   isMaximized?: boolean;
@@ -59,9 +60,8 @@ const getRuleName = (rule?: SimRule | null) => {
  * 界面核心页签导航
  * 'deployments' - 运行实例面板
  * 'rules' - 规则整编面板
- * 'logs' - 威胁审计日志
  */
-const activeTab = ref<"deployments" | "rules" | "logs">("deployments");
+const activeTab = ref<"deployments" | "rules">("deployments");
 
 /** 非列表业务操作的全局加载状态。 */
 const isLoading = ref(false);
@@ -69,7 +69,6 @@ const isLoading = ref(false);
 /** 各页签表格区域的独立加载状态，避免列表刷新遮挡整个应用。 */
 const deploymentsLoading = ref(false);
 const rulesLoading = ref(false);
-const logsLoading = ref(false);
 
 const confirmationState = ref({
   visible: false,
@@ -215,6 +214,9 @@ const selectedNodeId = ref("local");
 /** 仿真服务运行实例列表 */
 const instances = ref<SimInstance[]>([]);
 
+/** 当前打开诱捕审计对话框的实例。 */
+const auditInstance = ref<SimInstance | null>(null);
+
 /** 被勾选的多选实例 ID 集合 */
 const selectedInstanceIds = ref<string[]>([]);
 
@@ -236,19 +238,6 @@ const canConfirmDeploy = computed(
 
 /** 部署弹窗默认目标节点。 */
 const defaultDeployNodeId = computed(() => "local");
-
-/** 威胁审计日志数据列表 */
-const logs = ref<SimLog[]>([]);
-
-// 威胁审计日志的分页及自动刷新相关状态
-const logPage = ref(1);
-const logPageSize = ref(50);
-const logTotal = ref(0);
-const logTotalPages = computed(() =>
-  Math.max(1, Math.ceil(logTotal.value / logPageSize.value)),
-);
-const isAutoRefreshLogs = ref(false);
-let logRefreshTimer: ReturnType<typeof setInterval> | null = null;
 
 /** 运行中实例列表表格列配置项 */
 const instanceColumns = computed<SecLabTableColumn[]>(() => [
@@ -318,40 +307,6 @@ const extendedRuleColumns = computed<SecLabTableColumn[]>(() => [
     slot: "protocol",
   },
   { label: t("common.actions"), width: 220, align: "center", slot: "actions" },
-]);
-
-/** 诱捕审计日志列表表格列配置项 */
-const logColumns = computed<SecLabTableColumn[]>(() => [
-  { label: t("common.index"), width: 70, align: "center", slot: "index" },
-  {
-    label: t("app.simulation.logs.columns.time"),
-    width: 180,
-    align: "center",
-    slot: "time",
-  },
-  {
-    prop: "clientIp",
-    label: t("app.simulation.logs.columns.clientIp"),
-    width: 140,
-    align: "center",
-  },
-  {
-    prop: "clientPort",
-    label: t("app.simulation.logs.columns.clientPort"),
-    width: 100,
-    align: "center",
-  },
-  {
-    label: t("app.simulation.logs.columns.eventType"),
-    width: 140,
-    align: "center",
-    slot: "type",
-  },
-  {
-    label: t("app.simulation.logs.columns.summary"),
-    width: 450,
-    slot: "summary",
-  },
 ]);
 
 const currentPackage = ref<SimRulePackage | null>(null);
@@ -461,34 +416,10 @@ const loadNodes = async () => {
 };
 
 /**
- * 获取当前套件上下文中的威胁审计日志列表。
- */
-const loadLogs = async (silent = false) => {
-  if (!selectedNodeId.value) return;
-  if (!silent) logsLoading.value = true;
-  try {
-    const logRes = await simulationApi.listLogs({
-      page: logPage.value,
-      pageSize: logPageSize.value,
-    });
-    if (logRes.success && logRes.data) {
-      logs.value = logRes.data.records;
-      logTotal.value = logRes.data.total;
-    }
-  } catch {
-    notificationStore.error(
-      t("app.simulation.deployments.messages.loadInstancesFailed"),
-    );
-  } finally {
-    if (!silent) logsLoading.value = false;
-  }
-};
-
-/**
- * 获取当前套件上下文中正在运行的仿真实例列表及威胁审计日志。
+ * 获取当前套件上下文中正在运行的仿真实例列表。
  * @param silent 若为 true，则启用静默加载，不展示可能导致屏幕闪烁的全局 Loading 遮罩层。这常用于静默轮询。
  */
-const loadNodeInstancesAndLogs = async (silent = false) => {
+const loadNodeInstances = async (silent = false) => {
   if (!selectedNodeId.value) return;
   selectedInstanceIds.value = [];
   if (!silent) deploymentsLoading.value = true;
@@ -498,7 +429,6 @@ const loadNodeInstancesAndLogs = async (silent = false) => {
       instances.value = instRes.data;
       prunePcapStartClientTimes();
     }
-    await loadLogs(true);
   } catch {
     notificationStore.error(
       t("app.simulation.deployments.messages.loadInstancesFailed"),
@@ -514,35 +444,7 @@ watch(activeTab, (tab) => {
     void loadRules();
   } else if (tab === "deployments") {
     void loadNodes();
-    void loadNodeInstancesAndLogs();
-  } else if (tab === "logs") {
-    void loadNodes();
-    void loadLogs();
-  }
-  if (tab !== "logs") {
-    isAutoRefreshLogs.value = false;
-  }
-});
-
-// 监听分页状态变化以更新日志
-watch([logPage, logPageSize], () => {
-  if (activeTab.value === "logs") {
-    void loadLogs();
-  }
-});
-
-// 监听自动刷新开关
-watch(isAutoRefreshLogs, (val) => {
-  if (logRefreshTimer) {
-    clearInterval(logRefreshTimer);
-    logRefreshTimer = null;
-  }
-  if (val) {
-    logRefreshTimer = setInterval(() => {
-      if (activeTab.value === "logs") {
-        void loadLogs(true);
-      }
-    }, 10000);
+    void loadNodeInstances();
   }
 });
 
@@ -768,7 +670,7 @@ onMounted(() => {
   void loadNodes();
   void loadCurrentPackage();
   void loadRules();
-  void loadNodeInstancesAndLogs();
+  void loadNodeInstances();
 
   // 维持秒级累加计时器，服务于流量捕获倒计时的状态刷新
   timerId = setInterval(() => {
@@ -781,9 +683,6 @@ onUnmounted(() => {
   resolveConfirmation(false);
   if (timerId) {
     clearInterval(timerId);
-  }
-  if (logRefreshTimer) {
-    clearInterval(logRefreshTimer);
   }
 });
 
@@ -1409,6 +1308,37 @@ const handleUndeploy = async (id: string) => {
   }
 };
 
+/** 打开与指定运行实例强关联的诱捕审计。 */
+const openInstanceAudit = (instance: SimInstance) => {
+  const rule = rules.value.find((item) => item.id === instance.ruleId);
+  auditInstance.value = {
+    ...instance,
+    ruleName: getRuleName(rule) || instance.ruleName,
+  };
+};
+
+/** 构建实例行的统一操作菜单。 */
+interface InstanceMenuAction {
+  label: string;
+  icon: string;
+  className?: string;
+  handler: () => void;
+}
+
+const instanceActions = (instance: SimInstance): InstanceMenuAction[] => [
+  {
+    label: t("app.simulation.deployments.btnAudit"),
+    icon: "info",
+    handler: () => openInstanceAudit(instance),
+  },
+  {
+    label: t("app.simulation.deployments.btnUndeploy"),
+    icon: "trash",
+    className: "app-btn-delete",
+    handler: () => void handleUndeploy(instance.instanceId),
+  },
+];
+
 const isAllSelected = computed(() => {
   if (instances.value.length === 0) return false;
   return instances.value.every((inst) =>
@@ -1540,29 +1470,6 @@ const handleBatchUndeploy = async () => {
 };
 
 /**
- * 根据威胁等级/审计事件类型选择不同渲染色调的 Tag 标签
- * @param type 事件日志类别
- */
-const getEventTypeTag = (type: string) => {
-  if (type === "exploit_attempt") return "danger";
-  if (type === "http_request") return "info";
-  if (
-    type === "redis_command" ||
-    type === "ftp_command" ||
-    type === "rdp_negotiation"
-  )
-    return "warning";
-  if (
-    type === "smtp_command" ||
-    type === "pop3_command" ||
-    type === "imap_command"
-  )
-    return "warning";
-  if (type === "auth_attempt") return "danger";
-  return "success";
-};
-
-/**
  * 对仿真规则的漏洞分类标签执行本地多语言翻译
  * @param category 分类代码
  */
@@ -1671,7 +1578,6 @@ const handleDownloadPcap = async (row: SimInstance) => {
           v-for="(label, key) in {
             deployments: t('app.simulation.tabs.deployments'),
             rules: t('app.simulation.tabs.rules'),
-            logs: t('app.simulation.tabs.logs'),
           }"
           :key="key"
           class="tab-btn"
@@ -1851,13 +1757,10 @@ const handleDownloadPcap = async (row: SimInstance) => {
                 </div>
               </template>
               <template #actions="{ row }">
-                <SecLabButton
-                  type="danger"
-                  size="small"
-                  @click="handleUndeploy(row.instanceId)"
-                >
-                  {{ t("app.simulation.deployments.btnUndeploy") }}
-                </SecLabButton>
+                <SecLabActionMenu
+                  :label="t('common.actions')"
+                  :actions="instanceActions(toInstance(row))"
+                />
               </template>
               <template #empty>
                 <div class="empty-placeholder">
@@ -2141,91 +2044,6 @@ const handleDownloadPcap = async (row: SimInstance) => {
               :current-page="rulesCurrentPage"
               :total-pages="rulesTotalPages"
               @page-change="(p) => (rulesCurrentPage = p)"
-            />
-          </div>
-        </div>
-      </div>
-
-      <!-- TAB 3: 诱捕审计与抓包取证 (Logs) -->
-      <div
-        v-if="activeTab === 'logs'"
-        class="tab-content flex-column gap-layout"
-      >
-        <div class="control-header card-bg">
-          <div class="logs-toolbar-actions">
-            <div
-              class="flex-layout flex-align-center gap-layout"
-              style="gap: 6px; cursor: pointer; user-select: none"
-            >
-              <SecLabCheckbox
-                :model-value="isAutoRefreshLogs"
-                @change="(val) => (isAutoRefreshLogs = val)"
-              />
-              <span
-                style="font-size: 13px; color: var(--sdl-text-secondary)"
-                @click="isAutoRefreshLogs = !isAutoRefreshLogs"
-              >
-                {{ t("app.simulation.logs.autoRefresh") }}
-              </span>
-            </div>
-            <SecLabButton type="primary" size="small" @click="() => loadLogs()">
-              {{ t("app.simulation.logs.refresh") }}
-            </SecLabButton>
-          </div>
-        </div>
-
-        <div class="main-panel card-bg flex-column flex-1" data-slot="content">
-          <div class="table-body-region flex-1 overflow-auto">
-            <SecLabTable
-              :data="logs"
-              :columns="logColumns"
-              border
-              data-ui="sim-logs-table"
-            >
-              <template #index="{ index }">
-                {{ index + 1 }}
-              </template>
-              <template #time="{ row }">
-                <span class="mono-time">{{
-                  formatDateTime(row.timestamp)
-                }}</span>
-              </template>
-              <template #type="{ row }">
-                <SecLabTag :type="getEventTypeTag(row.eventType)" size="small">
-                  {{ row.eventType.toUpperCase() }}
-                </SecLabTag>
-              </template>
-              <template #summary="{ row }">
-                <SecLabTooltip :text="row.detailSummary" position="top">
-                  <div class="log-summary-cell" data-ui="log-summary-text">
-                    {{ row.detailSummary }}
-                  </div>
-                </SecLabTooltip>
-              </template>
-
-              <template #empty>
-                <div class="empty-placeholder">
-                  {{ t("app.simulation.logs.empty") }}
-                </div>
-              </template>
-            </SecLabTable>
-            <SecLabLoading
-              :loading="logsLoading"
-              cover
-              data-ui="sim-logs-loading"
-            />
-          </div>
-
-          <!-- 分页器 -->
-          <div
-            class="pagination-bar border-top flex-layout flex-align-center flex-end"
-            data-slot="footer"
-            style="padding: 10px 16px; display: flex; justify-content: flex-end"
-          >
-            <SecLabPagination
-              :current-page="logPage"
-              :total-pages="logTotalPages"
-              @page-change="(p) => (logPage = p)"
             />
           </div>
         </div>
@@ -2783,6 +2601,12 @@ const handleDownloadPcap = async (row: SimInstance) => {
       </template>
     </SecLabDialog>
 
+    <InstanceAuditDialog
+      :visible="auditInstance !== null"
+      :instance="auditInstance"
+      @close="auditInstance = null"
+    />
+
     <SecLabModal
       :visible="confirmationState.visible"
       :title="confirmationState.title"
@@ -3068,35 +2892,15 @@ const handleDownloadPcap = async (row: SimInstance) => {
   flex-wrap: wrap;
 }
 
-.logs-toolbar-actions {
-  margin-left: auto;
-  display: inline-flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: var(--sdl-space-4);
-}
-
 /* 分页条 */
 .pagination-bar {
   padding: var(--sdl-space-3) var(--sdl-space-4);
   flex-shrink: 0;
 }
 
-/* Logs and download pcap button */
-.mono-time {
-  font-family: var(--sdl-font-mono);
-  font-size: 12px;
-  color: var(--sdl-text-secondary);
-}
-
 .disabled-text {
   color: var(--sdl-text-subtle);
   font-size: 12px;
-}
-
-.log-actions {
-  display: flex;
-  justify-content: center;
 }
 
 .dialog-panel {
@@ -3329,13 +3133,6 @@ const handleDownloadPcap = async (row: SimInstance) => {
 .rule-link-text:hover {
   text-decoration: underline;
   opacity: 0.85;
-}
-
-.log-summary-cell {
-  max-width: 420px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .capturing-row-indicator {

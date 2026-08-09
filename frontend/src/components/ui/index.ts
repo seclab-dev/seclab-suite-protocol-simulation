@@ -11,6 +11,7 @@ export {
   SecLabTooltip,
   SecLabCheckbox,
   SecLabDescriptions,
+  SecLabActionMenu,
 } from "@seclab-dev/vue";
 
 export type { SecLabTableColumn } from "@seclab-dev/vue";

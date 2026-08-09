@@ -8,7 +8,6 @@ const en = {
       tabs: {
         rules: "Rules",
         deployments: "Deployments",
-        logs: "Audit Logs",
       },
       rules: {
         title: "Simulation Rules",
@@ -188,6 +187,7 @@ const en = {
       deployments: {
         port: "Listen Port",
         portPlaceholder: "e.g., 80",
+        btnAudit: "Audit",
         btnUndeploy: "Undeploy",
         btnBatchUndeploy: "Batch Undeploy",
         undeployConfirm:
@@ -233,6 +233,16 @@ const en = {
           batchUndeployError: "Error batch undeploying service instances",
         },
       },
+      auditDialog: {
+        title: "Honeypot Audit · {name}",
+        protocol: "Protocol",
+        listenPort: "Listen Port",
+        instanceId: "Instance ID",
+        total: "{total} records",
+        loadFailed: "Failed to load instance honeypot audit",
+        instanceUnavailable:
+          "This simulation instance has been undeployed and its audit records were removed",
+      },
       logs: {
         columns: {
           time: "Timestamp",
@@ -242,8 +252,7 @@ const en = {
           eventType: "Event Type",
           summary: "Semantic Overview",
         },
-        empty:
-          "This compute node is currently secure. No exploit audits or brute-force attempts caught.",
+        empty: "No honeypot interactions recorded for this instance.",
         autoRefresh: "Auto Refresh (10s)",
         refresh: "Refresh Now",
         messages: {

@@ -14,6 +14,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+const DEFAULT_AUDIT_MAX_PER_INSTANCE: usize = 10_000;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub http_port: u16,
@@ -24,6 +26,7 @@ pub struct Config {
     pub suite_instance_id: String,
     pub engine_image: String,
     pub event_callback_url: String,
+    pub audit_max_per_instance: usize,
 }
 
 #[derive(Clone)]
@@ -50,6 +53,7 @@ impl Config {
             "guowenju/seclab-protocol-simulation-engine:dev",
         );
         let event_callback_url = env_string("SECLAB_SIM_CALLBACK_URL", DEFAULT_EVENT_CALLBACK_URL);
+        let audit_max_per_instance = audit_max_per_instance_from_env();
 
         Self {
             http_port,
@@ -60,6 +64,7 @@ impl Config {
             suite_instance_id,
             engine_image,
             event_callback_url,
+            audit_max_per_instance,
         }
     }
 }
@@ -75,6 +80,7 @@ impl AppState {
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Normal)
+            .foreign_keys(true)
             .busy_timeout(Duration::from_secs(10));
         let db = SqlitePoolOptions::new()
             .max_connections(8)
@@ -83,7 +89,7 @@ impl AppState {
             .await
             .with_context(|| format!("failed to open sqlite database {}", db_path.display()))?;
         db::init(&db).await?;
-        let audit_logs = db::AuditLogWriter::start(db.clone());
+        let audit_logs = db::AuditLogWriter::start(db.clone(), config.audit_max_per_instance);
         let agent = agent::AgentClient::new(config.clone());
         Ok(Arc::new(Self {
             config,
@@ -91,6 +97,38 @@ impl AppState {
             audit_logs,
             agent,
         }))
+    }
+}
+
+/// 读取单实例审计保留上限，并保证安全实验所需的最低容量。
+fn audit_max_per_instance_from_env() -> usize {
+    let value = std::env::var("SECLAB_SIM_AUDIT_MAX_PER_INSTANCE").ok();
+    audit_max_per_instance(value.as_deref())
+}
+
+fn audit_max_per_instance(value: Option<&str>) -> usize {
+    match value {
+        Some(value) => match value.parse::<usize>() {
+            Ok(limit) if limit >= DEFAULT_AUDIT_MAX_PER_INSTANCE => limit,
+            Ok(limit) => {
+                tracing::warn!(
+                    configured_limit = limit,
+                    minimum_limit = DEFAULT_AUDIT_MAX_PER_INSTANCE,
+                    "configured audit log limit is below the minimum; using minimum"
+                );
+                DEFAULT_AUDIT_MAX_PER_INSTANCE
+            }
+            Err(error) => {
+                tracing::warn!(
+                    configured_value = value,
+                    %error,
+                    default_limit = DEFAULT_AUDIT_MAX_PER_INSTANCE,
+                    "invalid audit log limit; using default"
+                );
+                DEFAULT_AUDIT_MAX_PER_INSTANCE
+            }
+        },
+        None => DEFAULT_AUDIT_MAX_PER_INSTANCE,
     }
 }
 
@@ -127,6 +165,7 @@ mod tests {
             suite_instance_id: "instance-1".to_string(),
             engine_image: "protocol-simulation-engine:test".to_string(),
             event_callback_url: DEFAULT_EVENT_CALLBACK_URL.to_string(),
+            audit_max_per_instance: DEFAULT_AUDIT_MAX_PER_INSTANCE,
         };
 
         let state = AppState::initialize(config).await.unwrap();
@@ -136,5 +175,23 @@ mod tests {
             .unwrap();
 
         assert_eq!(journal_mode, "wal");
+    }
+
+    #[test]
+    fn audit_limit_uses_default_for_missing_or_invalid_values() {
+        assert_eq!(audit_max_per_instance(None), DEFAULT_AUDIT_MAX_PER_INSTANCE);
+        assert_eq!(
+            audit_max_per_instance(Some("invalid")),
+            DEFAULT_AUDIT_MAX_PER_INSTANCE
+        );
+    }
+
+    #[test]
+    fn audit_limit_enforces_minimum_and_accepts_higher_value() {
+        assert_eq!(
+            audit_max_per_instance(Some("9999")),
+            DEFAULT_AUDIT_MAX_PER_INSTANCE
+        );
+        assert_eq!(audit_max_per_instance(Some("20000")), 20_000);
     }
 }

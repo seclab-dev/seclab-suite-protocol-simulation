@@ -2,7 +2,6 @@ mod simulation;
 
 use anyhow::Context;
 use protocol_simulation_common::DEFAULT_EVENT_CALLBACK_URL;
-use serde::Serialize;
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -18,20 +17,6 @@ struct EngineConfig {
     node_id: String,
     port: u16,
     config_json: serde_json::Value,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct EngineEvent<'a> {
-    instance_id: &'a str,
-    rule_id: &'a str,
-    protocol: &'a str,
-    event_type: &'a str,
-    summary: &'a str,
-    client_ip: &'a str,
-    client_port: u16,
-    payload_hex: Option<&'a str>,
-    timestamp: String,
 }
 
 #[tokio::main]
@@ -51,8 +36,6 @@ async fn main() -> anyhow::Result<()> {
         port = config.port,
         "starting protocol simulation engine"
     );
-    report_startup_event(&config).await;
-
     let addr: SocketAddr = format!("0.0.0.0:{}", config.port)
         .parse()
         .context("invalid simulation bind address")?;
@@ -261,26 +244,4 @@ where
         .cloned()
         .unwrap_or(value);
     serde_json::from_value(config).context("failed to parse simulation rule config")
-}
-
-async fn report_startup_event(config: &EngineConfig) {
-    let event = EngineEvent {
-        instance_id: &config.instance_id,
-        rule_id: &config.rule_id,
-        protocol: &config.protocol,
-        event_type: "engine_started",
-        summary: "Protocol simulation engine started",
-        client_ip: "127.0.0.1",
-        client_port: 0,
-        payload_hex: None,
-        timestamp: chrono::Utc::now().to_rfc3339(),
-    };
-    if let Err(err) = reqwest::Client::new()
-        .post(&config.callback_url)
-        .json(&event)
-        .send()
-        .await
-    {
-        tracing::warn!("failed to report startup event: {}", err);
-    }
 }

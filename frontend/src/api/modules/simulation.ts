@@ -64,6 +64,8 @@ export interface SimInstance {
   instanceId: string;
   nodeId: string;
   ruleId: number;
+  ruleName: string;
+  protocol: string;
   listenPort: number;
   status: "active" | "inactive" | "error";
   errorMessage?: string;
@@ -158,8 +160,6 @@ type SuiteInstance = {
 type SuiteLog = {
   id: number;
   instanceId: string;
-  ruleId: string;
-  protocol: string;
   eventType: string;
   summary: string;
   clientIp: string;
@@ -256,6 +256,8 @@ function mapInstance(instance: SuiteInstance): SimInstance {
     instanceId: instance.id,
     nodeId: "local",
     ruleId: rememberRuleId(instance.ruleId),
+    ruleName: instance.ruleName,
+    protocol: instance.protocol,
     listenPort: instance.hostPort,
     status:
       instance.status === "running" || instance.status === "deploying"
@@ -403,7 +405,10 @@ export const simulationApi = {
         }
       : fail<SimInstance[]>(res);
   },
-  async listLogs(params?: { page?: number; pageSize?: number }): Promise<
+  async listInstanceAuditLogs(
+    instanceId: string,
+    params?: { page?: number; pageSize?: number },
+  ): Promise<
     ApiEnvelope<{
       total: number;
       page: number;
@@ -411,20 +416,31 @@ export const simulationApi = {
       records: SimLog[];
     }>
   > {
-    const res = await request<SuiteLog[]>(apiUrl("/api/logs"));
-    if (!res.success || !res.data) return fail(res);
     const page = params?.page ?? 1;
     const pageSize = params?.pageSize ?? 50;
-    const records = res.data.map(mapLog);
-    return {
-      success: true,
-      data: {
-        total: records.length,
-        page,
-        pageSize,
-        records: records.slice((page - 1) * pageSize, page * pageSize),
-      },
-    };
+    const query = new URLSearchParams({
+      page: String(page),
+      pageSize: String(pageSize),
+    });
+    const res = await request<{
+      total: number;
+      page: number;
+      pageSize: number;
+      records: SuiteLog[];
+    }>(
+      apiUrl(
+        `/api/instances/${encodeURIComponent(instanceId)}/audit-logs?${query.toString()}`,
+      ),
+    );
+    return res.success && res.data
+      ? {
+          success: true,
+          data: {
+            ...res.data,
+            records: res.data.records.map(mapLog),
+          },
+        }
+      : fail(res);
   },
   async startCapture(instanceId: string): Promise<ApiEnvelope<SimInstance>> {
     const res = await request<SuiteInstance>(

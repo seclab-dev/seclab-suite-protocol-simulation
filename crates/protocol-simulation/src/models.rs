@@ -65,8 +65,6 @@ pub struct DeployInstanceRequest {
 pub struct AuditLog {
     pub id: i64,
     pub instance_id: String,
-    pub rule_id: String,
-    pub protocol: String,
     pub event_type: String,
     pub summary: String,
     pub client_ip: String,
@@ -79,8 +77,6 @@ pub struct AuditLog {
 #[serde(rename_all = "camelCase")]
 pub struct EventRequest {
     pub instance_id: String,
-    pub rule_id: String,
-    pub protocol: String,
     pub event_type: String,
     pub summary: String,
     #[serde(default = "default_client_ip")]
@@ -91,6 +87,15 @@ pub struct EventRequest {
     pub payload_hex: Option<String>,
     #[serde(default)]
     pub timestamp: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditLogPage {
+    pub total: i64,
+    pub page: u32,
+    pub page_size: u32,
+    pub records: Vec<AuditLog>,
 }
 
 #[derive(Debug, Serialize)]

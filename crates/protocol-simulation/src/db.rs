@@ -2,6 +2,8 @@ use super::models::{AuditLog, EventRequest, Instance, Rule, RulePackageSummary};
 use super::rule_package::ImportedRulePackage;
 use anyhow::{Context, anyhow};
 use sqlx::SqlitePool;
+use std::collections::HashMap;
+use std::fmt;
 use tokio::sync::{mpsc, oneshot};
 
 const AUDIT_LOG_QUEUE_CAPACITY: usize = 4_096;
@@ -15,32 +17,65 @@ pub struct AuditLogWriter {
 
 struct AuditLogWriteRequest {
     event: EventRequest,
-    response: oneshot::Sender<anyhow::Result<AuditLog>>,
+    response: oneshot::Sender<Result<AuditLog, AuditLogWriteError>>,
+}
+
+#[derive(Debug)]
+pub enum AuditLogWriteError {
+    InstanceNotFound,
+    Internal(anyhow::Error),
+}
+
+impl fmt::Display for AuditLogWriteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InstanceNotFound => formatter.write_str("simulation instance not found"),
+            Self::Internal(error) => write!(formatter, "{error:#}"),
+        }
+    }
+}
+
+impl std::error::Error for AuditLogWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InstanceNotFound => None,
+            Self::Internal(error) => Some(error.as_ref()),
+        }
+    }
 }
 
 impl AuditLogWriter {
     /// 启动单写者后台任务，避免多个 SQLite 连接竞争写锁。
-    pub fn start(db: SqlitePool) -> Self {
+    pub fn start(db: SqlitePool, max_logs_per_instance: usize) -> Self {
         let (sender, receiver) = mpsc::channel(AUDIT_LOG_QUEUE_CAPACITY);
-        tokio::spawn(run_audit_log_writer(db, receiver));
+        tokio::spawn(run_audit_log_writer(db, receiver, max_logs_per_instance));
         Self { sender }
     }
 
     /// 将一条审计事件加入有界队列并等待事务提交结果。
-    pub async fn write(&self, event: EventRequest) -> anyhow::Result<AuditLog> {
+    pub async fn write(&self, event: EventRequest) -> Result<AuditLog, AuditLogWriteError> {
         let (response, result) = oneshot::channel();
         self.sender
             .send(AuditLogWriteRequest { event, response })
             .await
-            .map_err(|_| anyhow!("audit log writer is unavailable"))?;
-        result
-            .await
-            .context("audit log writer stopped before returning a result")?
+            .map_err(|_| {
+                AuditLogWriteError::Internal(anyhow!("audit log writer is unavailable"))
+            })?;
+        result.await.map_err(|error| {
+            AuditLogWriteError::Internal(
+                anyhow!(error).context("audit log writer stopped before returning a result"),
+            )
+        })?
     }
 }
 
 /// 持续收集当前已排队事件，并以有限批次提交到数据库。
-async fn run_audit_log_writer(db: SqlitePool, mut receiver: mpsc::Receiver<AuditLogWriteRequest>) {
+async fn run_audit_log_writer(
+    db: SqlitePool,
+    mut receiver: mpsc::Receiver<AuditLogWriteRequest>,
+    max_logs_per_instance: usize,
+) {
+    let mut instance_counts = HashMap::new();
     while let Some(first) = receiver.recv().await {
         let mut requests = Vec::with_capacity(AUDIT_LOG_BATCH_SIZE);
         requests.push(first);
@@ -52,20 +87,50 @@ async fn run_audit_log_writer(db: SqlitePool, mut receiver: mpsc::Receiver<Audit
             }
         }
 
-        let events = requests
-            .iter()
-            .map(|request| &request.event)
-            .collect::<Vec<_>>();
-        match insert_log_batch(&db, &events).await {
-            Ok(logs) => {
-                for (request, log) in requests.into_iter().zip(logs) {
-                    let _ = request.response.send(Ok(log));
+        let mut grouped = HashMap::<String, Vec<AuditLogWriteRequest>>::new();
+        for request in requests {
+            grouped
+                .entry(request.event.instance_id.clone())
+                .or_default()
+                .push(request);
+        }
+
+        for (instance_id, requests) in grouped {
+            let events = requests
+                .iter()
+                .map(|request| &request.event)
+                .collect::<Vec<_>>();
+            let cached_count = instance_counts.get(&instance_id).copied();
+            match insert_instance_log_batch(
+                &db,
+                &instance_id,
+                &events,
+                max_logs_per_instance,
+                cached_count,
+            )
+            .await
+            {
+                Ok((logs, retained_count)) => {
+                    instance_counts.insert(instance_id, retained_count);
+                    for (request, log) in requests.into_iter().zip(logs) {
+                        let _ = request.response.send(Ok(log));
+                    }
                 }
-            }
-            Err(error) => {
-                let detail = format!("{error:#}");
-                for request in requests {
-                    let _ = request.response.send(Err(anyhow!(detail.clone())));
+                Err(AuditLogWriteError::InstanceNotFound) => {
+                    instance_counts.remove(&instance_id);
+                    for request in requests {
+                        let _ = request
+                            .response
+                            .send(Err(AuditLogWriteError::InstanceNotFound));
+                    }
+                }
+                Err(AuditLogWriteError::Internal(error)) => {
+                    let detail = format!("{error:#}");
+                    for request in requests {
+                        let _ = request
+                            .response
+                            .send(Err(AuditLogWriteError::Internal(anyhow!(detail.clone()))));
+                    }
                 }
             }
         }
@@ -146,14 +211,13 @@ pub async fn init(db: &SqlitePool) -> anyhow::Result<()> {
         CREATE TABLE IF NOT EXISTS audit_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             instance_id TEXT NOT NULL,
-            rule_id TEXT NOT NULL,
-            protocol TEXT NOT NULL,
             event_type TEXT NOT NULL,
             summary TEXT NOT NULL,
             client_ip TEXT NOT NULL,
             client_port INTEGER NOT NULL,
             payload_hex TEXT,
-            timestamp TEXT NOT NULL
+            timestamp TEXT NOT NULL,
+            FOREIGN KEY(instance_id) REFERENCES instances(id) ON DELETE CASCADE
         );
         "#,
     )
@@ -163,9 +227,11 @@ pub async fn init(db: &SqlitePool) -> anyhow::Result<()> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_instances_status ON instances(status);")
         .execute(db)
         .await?;
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON audit_logs(timestamp DESC);")
-        .execute(db)
-        .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_logs_instance_id ON audit_logs(instance_id, id DESC);",
+    )
+    .execute(db)
+    .await?;
     Ok(())
 }
 
@@ -456,14 +522,40 @@ pub async fn update_pcap_state(
     get_instance(db, id).await
 }
 
-async fn insert_log_batch(
+async fn insert_instance_log_batch(
     db: &SqlitePool,
+    instance_id: &str,
     events: &[&EventRequest],
-) -> anyhow::Result<Vec<AuditLog>> {
+    max_logs_per_instance: usize,
+    cached_count: Option<usize>,
+) -> Result<(Vec<AuditLog>, usize), AuditLogWriteError> {
     let mut transaction = db
         .begin()
         .await
-        .context("failed to begin audit log batch")?;
+        .context("failed to begin audit log batch")
+        .map_err(AuditLogWriteError::Internal)?;
+    let instance_exists =
+        sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM instances WHERE id = ?1)")
+            .bind(instance_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .context("failed to validate audit log instance")
+            .map_err(AuditLogWriteError::Internal)?;
+    if !instance_exists {
+        return Err(AuditLogWriteError::InstanceNotFound);
+    }
+
+    let current_count = match cached_count {
+        Some(count) => count,
+        None => {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM audit_logs WHERE instance_id = ?1")
+                .bind(instance_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .context("failed to count instance audit logs")
+                .map_err(AuditLogWriteError::Internal)? as usize
+        }
+    };
     let mut logs = Vec::with_capacity(events.len());
     for event in events {
         let timestamp = event
@@ -473,17 +565,14 @@ async fn insert_log_batch(
         let log = sqlx::query_as::<_, AuditLog>(
             r#"
             INSERT INTO audit_logs (
-                instance_id, rule_id, protocol, event_type, summary,
-                client_ip, client_port, payload_hex, timestamp
+                instance_id, event_type, summary, client_ip, client_port, payload_hex, timestamp
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-            RETURNING id, instance_id, rule_id, protocol, event_type, summary,
-                      client_ip, client_port, payload_hex, timestamp
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            RETURNING id, instance_id, event_type, summary, client_ip, client_port,
+                      payload_hex, timestamp
             "#,
         )
-        .bind(&event.instance_id)
-        .bind(&event.rule_id)
-        .bind(&event.protocol)
+        .bind(instance_id)
         .bind(&event.event_type)
         .bind(&event.summary)
         .bind(&event.client_ip)
@@ -492,29 +581,71 @@ async fn insert_log_batch(
         .bind(timestamp)
         .fetch_one(&mut *transaction)
         .await
-        .context("failed to insert audit log")?;
+        .context("failed to insert audit log")
+        .map_err(AuditLogWriteError::Internal)?;
         logs.push(log);
+    }
+
+    let total_count = current_count.saturating_add(logs.len());
+    let overflow = total_count.saturating_sub(max_logs_per_instance);
+    if overflow > 0 {
+        sqlx::query(
+            r#"
+            DELETE FROM audit_logs
+             WHERE id IN (
+                SELECT id
+                  FROM audit_logs
+                 WHERE instance_id = ?1
+                 ORDER BY id ASC
+                 LIMIT ?2
+             )
+            "#,
+        )
+        .bind(instance_id)
+        .bind(i64::try_from(overflow).unwrap_or(i64::MAX))
+        .execute(&mut *transaction)
+        .await
+        .context("failed to prune instance audit logs")
+        .map_err(AuditLogWriteError::Internal)?;
     }
     transaction
         .commit()
         .await
-        .context("failed to commit audit log batch")?;
-    Ok(logs)
+        .context("failed to commit audit log batch")
+        .map_err(AuditLogWriteError::Internal)?;
+    Ok((logs, total_count.min(max_logs_per_instance)))
 }
 
-pub async fn list_logs(db: &SqlitePool) -> anyhow::Result<Vec<AuditLog>> {
-    sqlx::query_as::<_, AuditLog>(
+pub async fn list_instance_logs(
+    db: &SqlitePool,
+    instance_id: &str,
+    page: u32,
+    page_size: u32,
+) -> anyhow::Result<(i64, Vec<AuditLog>)> {
+    let total =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM audit_logs WHERE instance_id = ?1")
+            .bind(instance_id)
+            .fetch_one(db)
+            .await
+            .context("failed to count instance audit logs")?;
+    let offset = i64::from(page.saturating_sub(1)) * i64::from(page_size);
+    let records = sqlx::query_as::<_, AuditLog>(
         r#"
-        SELECT id, instance_id, rule_id, protocol, event_type, summary,
-               client_ip, client_port, payload_hex, timestamp
+        SELECT id, instance_id, event_type, summary, client_ip, client_port,
+               payload_hex, timestamp
           FROM audit_logs
-         ORDER BY timestamp DESC, id DESC
-         LIMIT 500
+         WHERE instance_id = ?1
+         ORDER BY id DESC
+         LIMIT ?2 OFFSET ?3
         "#,
     )
+    .bind(instance_id)
+    .bind(i64::from(page_size))
+    .bind(offset)
     .fetch_all(db)
     .await
-    .context("failed to list audit logs")
+    .context("failed to list instance audit logs")?;
+    Ok((total, records))
 }
 
 async fn ensure_column(
@@ -542,11 +673,9 @@ async fn ensure_column(
 mod tests {
     use super::*;
 
-    fn event(index: usize) -> EventRequest {
+    fn event(instance_id: &str, index: usize) -> EventRequest {
         EventRequest {
-            instance_id: format!("instance-{index}"),
-            rule_id: "rule-1".to_string(),
-            protocol: "http".to_string(),
+            instance_id: instance_id.to_string(),
             event_type: "connection".to_string(),
             summary: format!("event {index}"),
             client_ip: "192.0.2.1".to_string(),
@@ -576,6 +705,21 @@ mod tests {
         }
     }
 
+    async fn insert_rule_and_instance(db: &SqlitePool, instance_id: &str, port: i64) {
+        sqlx::query(
+            "INSERT OR IGNORE INTO rules (id, name, protocol, default_port, config_json) \
+             VALUES ('rule-1', 'HTTP simulation', 'http', 8080, '{}')",
+        )
+        .execute(db)
+        .await
+        .unwrap();
+        assert!(
+            insert_instance_if_port_available(db, &instance(instance_id, port))
+                .await
+                .unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn init_creates_empty_rule_table() {
         let db = SqlitePool::connect("sqlite::memory:").await.unwrap();
@@ -588,12 +732,13 @@ mod tests {
     async fn audit_log_writer_serializes_concurrent_events() {
         let db = SqlitePool::connect("sqlite::memory:").await.unwrap();
         init(&db).await.unwrap();
-        let writer = AuditLogWriter::start(db.clone());
+        insert_rule_and_instance(&db, "instance-1", 8080).await;
+        let writer = AuditLogWriter::start(db.clone(), 10_000);
         let mut writes = tokio::task::JoinSet::new();
 
         for index in 0..256 {
             let writer = writer.clone();
-            writes.spawn(async move { writer.write(event(index)).await });
+            writes.spawn(async move { writer.write(event("instance-1", index)).await });
         }
         while let Some(result) = writes.join_next().await {
             result.unwrap().unwrap();
@@ -604,6 +749,96 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 256);
+    }
+
+    #[tokio::test]
+    async fn audit_log_retention_keeps_latest_ten_thousand_per_instance() {
+        let db = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        init(&db).await.unwrap();
+        insert_rule_and_instance(&db, "instance-1", 8080).await;
+
+        let mut count = None;
+        for start in (0..10_001).step_by(AUDIT_LOG_BATCH_SIZE) {
+            let events = (start..(start + AUDIT_LOG_BATCH_SIZE).min(10_001))
+                .map(|index| event("instance-1", index))
+                .collect::<Vec<_>>();
+            let references = events.iter().collect::<Vec<_>>();
+            let (_, retained_count) =
+                insert_instance_log_batch(&db, "instance-1", &references, 10_000, count)
+                    .await
+                    .unwrap();
+            count = Some(retained_count);
+        }
+
+        let summaries = sqlx::query_scalar::<_, String>(
+            "SELECT summary FROM audit_logs WHERE instance_id = 'instance-1' ORDER BY id ASC",
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        assert_eq!(summaries.len(), 10_000);
+        assert_eq!(summaries.first().unwrap(), "event 1");
+        assert_eq!(summaries.last().unwrap(), "event 10000");
+    }
+
+    #[tokio::test]
+    async fn deleting_instance_cascades_audit_logs() {
+        let db = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        init(&db).await.unwrap();
+        insert_rule_and_instance(&db, "instance-1", 8080).await;
+        let event = event("instance-1", 1);
+        insert_instance_log_batch(&db, "instance-1", &[&event], 10_000, None)
+            .await
+            .unwrap();
+
+        delete_instance(&db, "instance-1").await.unwrap();
+
+        let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM audit_logs")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn missing_instance_does_not_block_other_instance_batch() {
+        let db = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        init(&db).await.unwrap();
+        insert_rule_and_instance(&db, "instance-1", 8080).await;
+        let writer = AuditLogWriter::start(db.clone(), 10_000);
+
+        let (missing, existing) = tokio::join!(
+            writer.write(event("missing", 1)),
+            writer.write(event("instance-1", 2)),
+        );
+
+        assert!(matches!(missing, Err(AuditLogWriteError::InstanceNotFound)));
+        assert_eq!(existing.unwrap().summary, "event 2");
+    }
+
+    #[tokio::test]
+    async fn instance_audit_logs_are_paginated_in_stable_order() {
+        let db = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        init(&db).await.unwrap();
+        insert_rule_and_instance(&db, "instance-1", 8080).await;
+        let events = (0..5)
+            .map(|index| event("instance-1", index))
+            .collect::<Vec<_>>();
+        let references = events.iter().collect::<Vec<_>>();
+        insert_instance_log_batch(&db, "instance-1", &references, 10_000, None)
+            .await
+            .unwrap();
+
+        let (total, records) = list_instance_logs(&db, "instance-1", 2, 2).await.unwrap();
+
+        assert_eq!(total, 5);
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.summary.as_str())
+                .collect::<Vec<_>>(),
+            vec!["event 2", "event 1"]
+        );
     }
 
     #[tokio::test]

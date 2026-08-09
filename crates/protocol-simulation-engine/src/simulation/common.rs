@@ -30,8 +30,6 @@ pub struct SimLogDraft {
 #[serde(rename_all = "camelCase")]
 struct EngineEvent {
     instance_id: String,
-    rule_id: String,
-    protocol: String,
     event_type: String,
     summary: String,
     client_ip: String,
@@ -72,7 +70,6 @@ async fn run_reporter(callback_url: String, mut receiver: mpsc::Receiver<SimLogD
     let client = reqwest::Client::new();
     let instance_id =
         std::env::var("SECLAB_SIM_INSTANCE_ID").unwrap_or_else(|_| "unknown".to_string());
-    let protocol = std::env::var("SECLAB_SIM_PROTOCOL").unwrap_or_else(|_| "unknown".to_string());
     let mut requests = JoinSet::new();
 
     loop {
@@ -89,12 +86,9 @@ async fn run_reporter(callback_url: String, mut receiver: mpsc::Receiver<SimLogD
                 let client = client.clone();
                 let callback_url = callback_url.clone();
                 let instance_id = instance_id.clone();
-                let protocol = protocol.clone();
                 requests.spawn(async move {
                     let event = EngineEvent {
                         instance_id,
-                        rule_id: draft.rule_id,
-                        protocol,
                         event_type: draft.event_type,
                         summary: draft.detail_summary,
                         client_ip: draft.client_ip,

@@ -10,7 +10,6 @@ const zh: typeof en = {
       tabs: {
         rules: "规则整编",
         deployments: "实例部署",
-        logs: "诱捕审计",
       },
       rules: {
         title: "仿真规则整编",
@@ -183,6 +182,7 @@ const zh: typeof en = {
       deployments: {
         port: "监听端口",
         portPlaceholder: "例如：80",
+        btnAudit: "审计",
         btnUndeploy: "下线",
         btnBatchUndeploy: "批量下线",
         undeployConfirm: "确定要下线仿真服务“{name}”吗？",
@@ -220,6 +220,15 @@ const zh: typeof en = {
           batchUndeployError: "批量下线服务实例异常",
         },
       },
+      auditDialog: {
+        title: "诱捕审计 · {name}",
+        protocol: "协议",
+        listenPort: "监听端口",
+        instanceId: "实例 ID",
+        total: "共 {total} 条",
+        loadFailed: "加载实例诱捕审计失败",
+        instanceUnavailable: "该仿真实例已下线，关联审计已销毁",
+      },
       logs: {
         columns: {
           time: "审计时间",
@@ -229,7 +238,7 @@ const zh: typeof en = {
           eventType: "事件类型",
           summary: "语义审计概要",
         },
-        empty: "此计算节点目前安全状态优良，暂无入侵审计及爆破日志捕获。",
+        empty: "当前实例暂无诱捕交互记录。",
         autoRefresh: "自动刷新 (10s)",
         refresh: "立即刷新",
         messages: {
