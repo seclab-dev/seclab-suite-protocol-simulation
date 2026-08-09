@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.1.0-alpha.1] - 2026-08-09
+
 ### Added
 
 - 首次发布协议仿真套件 API/UI 镜像和 engine workload 镜像。
