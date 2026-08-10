@@ -1301,7 +1301,6 @@ const executeDeploy = async () => {
     : deployForm.value.ruleId;
 
   isDeploying.value = true;
-  isLoading.value = true;
   try {
     const res = await simulationApi.deploySimulation({
       nodeId: deployForm.value.nodeId,
@@ -1343,7 +1342,6 @@ const executeDeploy = async () => {
     );
   } finally {
     isDeploying.value = false;
-    isLoading.value = false;
   }
 };
 
@@ -2726,6 +2724,7 @@ const handleDownloadPcap = async (row: SimInstance) => {
 
 <style scoped>
 .simulation-dashboard {
+  position: relative;
   height: 100%;
   padding: var(--sdl-space-4);
   background: var(--sdl-bg-canvas);
