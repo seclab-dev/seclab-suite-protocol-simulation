@@ -6,16 +6,22 @@ import {
   SecLabDescriptions,
   SecLabDialog,
 } from "@/components/ui";
-import type { SimRule } from "@/api/modules/simulation";
+import type {
+  SimRule,
+  SimulationFieldCapability,
+  SimulationProtocolCapability,
+} from "@/api/modules/simulation";
 import HttpRuleDetail from "./details/HttpRuleDetail.vue";
 import RedisRuleDetail from "./details/RedisRuleDetail.vue";
 import MailRuleDetail from "./details/MailRuleDetail.vue";
 import CredsRuleDetail from "./details/CredsRuleDetail.vue";
+import ProtocolNestedRuleDetail from "./details/ProtocolNestedRuleDetail.vue";
 import SimulationHtmlPreviewDialog from "./SimulationHtmlPreviewDialog.vue";
 
 const props = defineProps<{
   visible: boolean;
   rule: SimRule | null;
+  capability: SimulationProtocolCapability | null;
 }>();
 
 const emit = defineEmits<{
@@ -36,23 +42,41 @@ const parsedConfig = computed<Record<string, unknown> | null>(() => {
 });
 
 const protocol = computed(() => props.rule?.protocol || "");
+const isHttpRule = computed(() => protocol.value === "http");
 const isRedisRule = computed(() => protocol.value === "redis");
 const isMailRule = computed(() =>
   ["smtp", "pop3", "imap"].includes(protocol.value),
 );
 const isCredsRule = computed(() =>
-  ["ssh", "ftp", "rdp"].includes(protocol.value),
+  ["ssh", "ftp", "rdp", "telnet", "mysql", "postgresql", "ldap"].includes(
+    protocol.value,
+  ),
 );
-const requireAuth = computed(() => Boolean(parsedConfig.value?.require_auth));
-const banner = computed(() =>
-  typeof parsedConfig.value?.banner === "string"
-    ? parsedConfig.value.banner
-    : "",
-);
-const serverHeader = computed(() =>
-  typeof parsedConfig.value?.server_header === "string"
-    ? parsedConfig.value.server_header
-    : "",
+
+const fieldLabel = (field: SimulationFieldCapability) =>
+  t(`app.simulation.rules.fields.${field.labelKey}`);
+
+const formatFieldValue = (value: unknown) => {
+  if (Array.isArray(value)) return value.join(", ");
+  if (typeof value === "boolean") {
+    return t(
+      value
+        ? "app.simulation.rules.values.enabled"
+        : "app.simulation.rules.values.disabled",
+    );
+  }
+  if (typeof value === "number") return String(value);
+  if (typeof value === "string" && value.trim()) return value;
+  return t("common.none");
+};
+
+const visibleProtocolFields = computed(() =>
+  (props.capability?.fields ?? []).filter(
+    (field) =>
+      !field.secret &&
+      !["credentials", "key_value"].includes(field.kind) &&
+      parsedConfig.value?.[field.path] !== undefined,
+  ),
 );
 
 const getRuleName = (rule?: SimRule | null) => {
@@ -82,66 +106,41 @@ const detailItems = computed(() => {
       value: getRuleDescription(props.rule) || t("common.none"),
     },
   ];
-
-  if (isRedisRule.value) {
-    return [
-      ...baseItems,
-      {
-        label: "Redis AUTH",
-        value: requireAuth.value ? "enabled" : "disabled",
-      },
-    ];
-  }
-
-  if (isMailRule.value) {
-    return [
-      ...baseItems,
-      {
-        label: "Auth",
-        value: requireAuth.value ? "enabled" : "disabled",
-      },
-      {
-        label: "Banner",
-        value: banner.value || t("common.none"),
-      },
-    ];
-  }
-
-  if (isCredsRule.value) {
-    const items = [...baseItems];
-    if (banner.value) {
-      items.push({
-        label: "Banner",
-        value: banner.value,
-      });
-    }
-    const serverName =
-      typeof parsedConfig.value?.server_name === "string"
-        ? parsedConfig.value.server_name
-        : "";
-    if (serverName) {
-      items.push({
-        label: "Server Name",
-        value: serverName,
-      });
-    }
-    const allowAnonymous = parsedConfig.value?.allow_anonymous;
-    if (allowAnonymous !== undefined) {
-      items.push({
-        label: "Allow Anonymous",
-        value: allowAnonymous ? "Yes" : "No",
-      });
-    }
-    return items;
-  }
-
-  return [
+  const items = [
     ...baseItems,
-    {
-      label: "Server Header",
-      value: serverHeader.value || t("app.simulation.rules.systemDefaultNginx"),
-    },
+    ...visibleProtocolFields.value.map((field) => ({
+      label: fieldLabel(field),
+      value: formatFieldValue(parsedConfig.value?.[field.path]),
+    })),
   ];
+  const representedPaths = new Set(
+    visibleProtocolFields.value.map((field) => field.path),
+  );
+
+  const appendOptionalField = (path: string, labelKey: string) => {
+    const value = parsedConfig.value?.[path];
+    if (value === undefined || representedPaths.has(path)) return;
+    items.push({
+      label: t(`app.simulation.rules.fields.${labelKey}`),
+      value: formatFieldValue(value),
+    });
+  };
+
+  if (isMailRule.value || isRedisRule.value) {
+    appendOptionalField("require_auth", "requireAuth");
+  }
+  if (isHttpRule.value && !representedPaths.has("server_header")) {
+    items.push({
+      label: t("app.simulation.rules.fields.serverHeader"),
+      value: t("app.simulation.rules.systemDefaultNginx"),
+    });
+  }
+  if (protocol.value === "ftp") {
+    appendOptionalField("server_name", "serverName");
+    appendOptionalField("allow_anonymous", "allowAnonymous");
+  }
+
+  return items;
 });
 
 /** 打开套件内 HTML 预览，并固定本次预览内容。 */
@@ -178,22 +177,25 @@ watch(
         <SecLabDescriptions :items="detailItems" :column="2" border />
       </div>
 
-      <RedisRuleDetail v-if="isRedisRule" :config="parsedConfig" />
+      <HttpRuleDetail
+        v-if="isHttpRule"
+        :config="parsedConfig"
+        @preview="openHtmlPreview"
+      />
+      <RedisRuleDetail v-else-if="isRedisRule" :config="parsedConfig" />
       <MailRuleDetail
         v-else-if="isMailRule"
         :protocol="protocol"
         :config="parsedConfig"
       />
-      <CredsRuleDetail
-        v-else-if="isCredsRule"
-        :protocol="protocol"
-        :config="parsedConfig"
-      />
-      <HttpRuleDetail
-        v-else
-        :config="parsedConfig"
-        @preview="openHtmlPreview"
-      />
+      <template v-else>
+        <CredsRuleDetail
+          v-if="isCredsRule"
+          :protocol="protocol"
+          :config="parsedConfig"
+        />
+        <ProtocolNestedRuleDetail :protocol="protocol" :config="parsedConfig" />
+      </template>
     </div>
 
     <template #footer>

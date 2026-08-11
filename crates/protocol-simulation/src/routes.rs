@@ -1,5 +1,7 @@
 use super::AppState;
-use super::agent::{AgentApiError, StartWorkloadRequest, WorkloadPort, WorkloadResources};
+use super::agent::{
+    AgentApiError, StartWorkloadRequest, WorkloadPort, WorkloadResources, WorkloadTransport,
+};
 use super::db;
 use super::models::{
     ApiEnvelope, AuditLogPage, CreateRuleRequest, DeployInstanceRequest, ErrorEnvelope,
@@ -11,10 +13,15 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use protocol_simulation_common::{
+    BoundEndpoint, EngineLaunchConfig, ProtocolId, TransportProtocol, protocol_descriptor,
+    protocol_descriptors, validate_behavior,
+};
 use seclab_suite_runtime::{
     OperationEvent, OperationImpact, OperationOutcome, OperationTarget, ParameterValue,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
@@ -35,6 +42,7 @@ struct ApiError {
 pub fn router(state: Arc<AppState>) -> Router {
     let api = Router::new()
         .route("/health", get(health))
+        .route("/api/capabilities", get(get_capabilities))
         .route("/api/rules", get(list_rules).post(create_rule))
         .route("/api/rules/{id}", delete(delete_rule))
         .route("/api/rule-package/current", get(get_current_rule_package))
@@ -69,6 +77,22 @@ async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": true, "service": "protocol-simulation" }))
 }
 
+async fn get_capabilities() -> Json<ApiEnvelope<serde_json::Value>> {
+    Json(ApiEnvelope {
+        success: true,
+        data: serde_json::json!({
+            "schemaVersion": 1,
+            "protocols": protocol_descriptors(),
+            "features": {
+                "multiEndpoint": true,
+                "wholeWorkloadCapture": true,
+                "guidedRuleEditor": true,
+                "advancedJsonEditor": true
+            }
+        }),
+    })
+}
+
 async fn list_rules(State(state): State<Arc<AppState>>) -> ApiResult<impl IntoResponse> {
     let rules = db::list_rules(&state.db).await?;
     Ok(Json(ApiEnvelope {
@@ -83,12 +107,19 @@ async fn create_rule(
     Json(payload): Json<CreateRuleRequest>,
 ) -> ApiResult<impl IntoResponse> {
     let operation_context = operation_context(&headers);
-    validate_protocol(&payload.protocol)?;
+    let protocol = parse_protocol(&payload.protocol)?;
     if payload.name.trim().is_empty() {
         return Err(ApiError::bad_request("rule name is required"));
     }
     let id = format!("rule-{}", Uuid::now_v7());
-    let config_json = serde_json::to_string_pretty(&payload.config_json)
+    let behavior = payload
+        .config_json
+        .get("behavior")
+        .cloned()
+        .unwrap_or_else(|| payload.config_json.clone());
+    let behavior = validate_behavior(protocol, behavior)
+        .map_err(|error| ApiError::bad_request(format!("invalid protocol behavior: {error}")))?;
+    let config_json = serde_json::to_string_pretty(&serde_json::json!({"behavior": behavior}))
         .map_err(|err| ApiError::bad_request(format!("invalid config JSON: {err}")))?;
     let rule = db::insert_rule(
         &state.db,
@@ -186,8 +217,16 @@ async fn import_rule_package(
     };
     let package = rule_package::parse_slrp(&archive)
         .map_err(|err| ApiError::bad_request(format!("invalid rule package: {err}")))?;
+    let platform_version = state.agent.platform_version().await?;
+    let minimum_version = semver::Version::parse(&package.min_seclab_version)
+        .map_err(|error| ApiError::bad_request(format!("invalid minSeclabVersion: {error}")))?;
+    if platform_version < minimum_version {
+        return Err(ApiError::bad_request(format!(
+            "rule package requires SecLab {minimum_version} or newer; current version is {platform_version}"
+        )));
+    }
     for rule in &package.rules {
-        validate_protocol(&rule.protocol)?;
+        parse_protocol(&rule.protocol)?;
     }
     let summary = db::import_rule_package(&state.db, &package).await?;
     emit_operation_event(
@@ -232,15 +271,76 @@ async fn deploy_instance(
     let Some(rule) = db::get_rule(&state.db, &payload.rule_id).await? else {
         return Err(ApiError::not_found("rule not found"));
     };
+    let protocol = parse_protocol(&rule.protocol)?;
+    let descriptor = protocol_descriptor(protocol);
+    let mut requested = HashMap::new();
+    for binding in payload.endpoint_bindings {
+        if binding.host_port == 0 {
+            return Err(ApiError::bad_request(
+                "endpoint host port must be between 1 and 65535",
+            ));
+        }
+        if requested
+            .insert(binding.endpoint_id.clone(), binding.host_port)
+            .is_some()
+        {
+            return Err(ApiError::bad_request(format!(
+                "duplicate endpoint binding: {}",
+                binding.endpoint_id
+            )));
+        }
+    }
+    let known = descriptor
+        .endpoints
+        .iter()
+        .map(|endpoint| endpoint.id.as_str())
+        .collect::<HashSet<_>>();
+    if let Some(unknown) = requested.keys().find(|id| !known.contains(id.as_str())) {
+        return Err(ApiError::bad_request(format!(
+            "unknown endpoint binding: {unknown}"
+        )));
+    }
+    let endpoints = descriptor
+        .endpoints
+        .iter()
+        .filter_map(|endpoint| {
+            requested
+                .get(&endpoint.id)
+                .map(|host_port| super::models::InstanceEndpoint {
+                    instance_id: String::new(),
+                    endpoint_id: endpoint.id.clone(),
+                    transport: endpoint.transport.as_str().to_string(),
+                    host_port: i64::from(*host_port),
+                    container_port: i64::from(endpoint.container_port),
+                })
+        })
+        .collect::<Vec<_>>();
+    if let Some(missing) = descriptor
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.required && !requested.contains_key(&endpoint.id))
+    {
+        return Err(ApiError::bad_request(format!(
+            "required endpoint binding is missing: {}",
+            missing.id
+        )));
+    }
     let now = chrono::Utc::now().to_rfc3339();
     let instance_id = format!("sim-{}", Uuid::now_v7());
+    let callback_token = Uuid::now_v7().to_string();
     let mut instance = Instance {
         id: instance_id.clone(),
         rule_id: rule.id.clone(),
         rule_name: rule.name.clone(),
         protocol: rule.protocol.clone(),
-        host_port: i64::from(payload.host_port),
-        container_port: i64::from(payload.host_port),
+        endpoints: endpoints
+            .into_iter()
+            .map(|mut endpoint| {
+                endpoint.instance_id.clone_from(&instance_id);
+                endpoint
+            })
+            .collect(),
+        callback_token: callback_token.clone(),
         status: "deploying".to_string(),
         workload_id: None,
         error_message: None,
@@ -252,33 +352,60 @@ async fn deploy_instance(
         updated_at: now,
     };
     if !db::insert_instance_if_port_available(&state.db, &instance).await? {
-        return Err(ApiError::conflict(format!(
-            "host port {} is already used by an active simulation instance",
-            payload.host_port
-        ))
+        return Err(ApiError::conflict(
+            "one or more endpoint bindings are already used by an active simulation instance",
+        )
         .with_message_key("app.simulation.deployments.messages.portOccupied"));
     }
 
     let config_json = serde_json::from_str::<serde_json::Value>(&rule.config_json)
         .unwrap_or_else(|_| serde_json::json!({}));
+    let behavior = config_json.get("behavior").cloned().unwrap_or(config_json);
+    let launch_config = EngineLaunchConfig {
+        schema_version: 1,
+        protocol,
+        rule_id: rule.id.clone(),
+        rule_name: rule.name.clone(),
+        instance_id: instance_id.clone(),
+        callback_url: state.config.event_callback_url.clone(),
+        callback_token,
+        endpoints: instance
+            .endpoints
+            .iter()
+            .map(|endpoint| BoundEndpoint {
+                endpoint_id: endpoint.endpoint_id.clone(),
+                transport: if endpoint.transport == "udp" {
+                    TransportProtocol::Udp
+                } else {
+                    TransportProtocol::Tcp
+                },
+                host_port: endpoint.host_port as u16,
+                container_port: endpoint.container_port as u16,
+            })
+            .collect(),
+        behavior,
+    };
     let agent_payload = StartWorkloadRequest {
         workload_kind: "simulation-rule".to_string(),
         workload_name: rule.id.clone(),
         image: state.config.engine_image.clone(),
-        ports: vec![WorkloadPort {
-            host_port: payload.host_port,
-            container_port: payload.host_port,
-            protocol: "tcp".to_string(),
-        }],
-        env: serde_json::json!({
-            "SECLAB_SIM_PROTOCOL": rule.protocol,
-            "SECLAB_SIM_RULE_ID": rule.id,
-            "SECLAB_SIM_RULE_NAME": rule.name,
-            "SECLAB_SIM_INSTANCE_ID": instance_id,
-            "SECLAB_SIM_PORT": payload.host_port.to_string(),
-            "SECLAB_SIM_CALLBACK_URL": state.config.event_callback_url.clone()
-        }),
-        config_json,
+        ports: instance
+            .endpoints
+            .iter()
+            .map(|endpoint| WorkloadPort {
+                endpoint_id: endpoint.endpoint_id.clone(),
+                host_port: endpoint.host_port as u16,
+                container_port: endpoint.container_port as u16,
+                protocol: if endpoint.transport == "udp" {
+                    WorkloadTransport::Udp
+                } else {
+                    WorkloadTransport::Tcp
+                },
+            })
+            .collect(),
+        env: serde_json::json!({}),
+        config_json: serde_json::to_value(launch_config)
+            .map_err(|error| ApiError::bad_request(format!("invalid launch config: {error}")))?,
         resources: WorkloadResources {
             memory_mb: 256,
             cpu_shares: 256,
@@ -322,10 +449,9 @@ async fn deploy_instance(
                 .expect("static operation event must be valid"),
             )
             .await;
-            return Err(ApiError::conflict(format!(
-                "host port {} is unavailable on the target node",
-                payload.host_port
-            ))
+            return Err(ApiError::conflict(
+                "one or more endpoint bindings are unavailable on the target node",
+            )
             .with_message_key("app.simulation.deployments.messages.portOccupied"));
         }
         Err(err) => {
@@ -497,9 +623,7 @@ async fn start_pcap(
         .workload_id
         .as_deref()
         .ok_or_else(|| ApiError::bad_request("instance workload is missing"))?;
-    let host_port = u16::try_from(instance.host_port)
-        .map_err(|_| ApiError::bad_request("invalid instance host port"))?;
-    let capture = match state.agent.start_pcap(workload_id, host_port).await {
+    let capture = match state.agent.start_pcap(workload_id).await {
         Ok(capture) => capture,
         Err(error) => {
             emit_operation_event(
@@ -838,8 +962,31 @@ async fn list_instance_logs(
 
 async fn record_event(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(payload): Json<EventRequest>,
 ) -> ApiResult<impl IntoResponse> {
+    validate_runtime_event(&payload)?;
+    let Some(instance) = db::get_instance(&state.db, &payload.instance_id).await? else {
+        return Err(ApiError::not_found("simulation instance not found"));
+    };
+    let presented = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    if !presented.is_some_and(|token| {
+        constant_time_eq::constant_time_eq(token.as_bytes(), instance.callback_token.as_bytes())
+    }) {
+        return Err(ApiError::unauthorized("invalid simulation callback token"));
+    }
+    if !instance
+        .endpoints
+        .iter()
+        .any(|endpoint| endpoint.endpoint_id == payload.endpoint_id)
+    {
+        return Err(ApiError::bad_request(
+            "event endpoint does not belong to instance",
+        ));
+    }
     let log = match state.audit_logs.write(payload).await {
         Ok(log) => log,
         Err(db::AuditLogWriteError::InstanceNotFound) => {
@@ -856,17 +1003,53 @@ async fn record_event(
     ))
 }
 
-fn validate_protocol(protocol: &str) -> ApiResult<()> {
-    if matches!(
-        protocol,
-        "http" | "redis" | "ssh" | "ftp" | "smtp" | "pop3" | "imap" | "rdp"
-    ) {
-        Ok(())
-    } else {
-        Err(ApiError::bad_request(format!(
-            "unsupported simulation protocol: {protocol}"
-        )))
+fn validate_runtime_event(event: &EventRequest) -> ApiResult<()> {
+    if event.schema_version != 1 {
+        return Err(ApiError::bad_request(
+            "only simulation runtime event schemaVersion 1 is supported",
+        ));
     }
+    Uuid::parse_str(&event.event_id)
+        .map_err(|_| ApiError::bad_request("eventId must be a UUID"))?;
+    if event.event_type.is_empty()
+        || event.event_type.len() > 64
+        || !event
+            .event_type
+            .chars()
+            .all(|value| value.is_ascii_lowercase() || value.is_ascii_digit() || value == '_')
+    {
+        return Err(ApiError::bad_request("eventType is invalid"));
+    }
+    if event.summary.is_empty() || event.summary.len() > 2_048 {
+        return Err(ApiError::bad_request(
+            "event summary must contain between 1 and 2048 bytes",
+        ));
+    }
+    if !event.metadata.is_object()
+        || serde_json::to_vec(&event.metadata).is_ok_and(|value| value.len() > 16 * 1024)
+    {
+        return Err(ApiError::bad_request(
+            "event metadata is invalid or too large",
+        ));
+    }
+    if let Some(payload) = event.payload_hex.as_deref()
+        && (payload.len() > 8 * 1024
+            || !payload.len().is_multiple_of(2)
+            || !payload.chars().all(|value| value.is_ascii_hexdigit()))
+    {
+        return Err(ApiError::bad_request(
+            "event payloadHex is invalid or too large",
+        ));
+    }
+    if let Some(timestamp) = event.timestamp.as_deref() {
+        chrono::DateTime::parse_from_rfc3339(timestamp)
+            .map_err(|_| ApiError::bad_request("event timestamp must be RFC 3339"))?;
+    }
+    Ok(())
+}
+
+fn parse_protocol(protocol: &str) -> ApiResult<ProtocolId> {
+    ProtocolId::from_str(protocol).map_err(ApiError::bad_request)
 }
 
 fn operation_event(
@@ -928,6 +1111,14 @@ async fn emit_operation_event(state: &AppState, event: OperationEvent) {
 }
 
 impl ApiError {
+    fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: message.into(),
+            message_key: None,
+            cause: None,
+        }
+    }
     fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
@@ -1072,5 +1263,25 @@ mod tests {
                 .as_object()
                 .is_some_and(|value| value.is_empty())
         );
+    }
+
+    #[test]
+    fn runtime_event_validation_rejects_oversized_or_non_hex_payloads() {
+        let mut event = EventRequest {
+            schema_version: 1,
+            event_id: Uuid::now_v7().to_string(),
+            instance_id: "instance-1".to_string(),
+            endpoint_id: "main".to_string(),
+            event_type: "connection".to_string(),
+            summary: "client connected".to_string(),
+            client_ip: "192.0.2.1".to_string(),
+            client_port: 12345,
+            payload_hex: Some("00ff".to_string()),
+            metadata: serde_json::json!({"protocol": "http"}),
+            timestamp: Some("2026-08-11T00:00:00Z".to_string()),
+        };
+        assert!(validate_runtime_event(&event).is_ok());
+        event.payload_hex = Some("not-hex".to_string());
+        assert!(validate_runtime_event(&event).is_err());
     }
 }

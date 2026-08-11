@@ -56,6 +56,12 @@ const columns = computed<SecLabTableColumn[]>(() => [
     slot: "time",
   },
   {
+    prop: "endpointId",
+    label: t("app.simulation.logs.columns.endpoint"),
+    width: 100,
+    align: "center",
+  },
+  {
     prop: "clientIp",
     label: t("app.simulation.logs.columns.clientIp"),
     width: 140,
@@ -193,7 +199,14 @@ onUnmounted(() => {
         </span>
         <span>
           <strong>{{ t("app.simulation.auditDialog.listenPort") }}</strong>
-          {{ instance?.listenPort ?? "-" }}
+          {{
+            instance?.endpoints
+              .map(
+                (endpoint) =>
+                  endpoint.hostPort + "/" + endpoint.transport.toUpperCase(),
+              )
+              .join(", ") || "-"
+          }}
         </span>
         <span class="audit-instance-id">
           <strong>{{ t("app.simulation.auditDialog.instanceId") }}</strong>
@@ -242,7 +255,10 @@ onUnmounted(() => {
             </SecLabTag>
           </template>
           <template #summary="{ row }">
-            <SecLabTooltip :text="row.detailSummary" position="top">
+            <SecLabTooltip
+              :text="row.detailSummary + '\n' + JSON.stringify(row.metadata)"
+              position="top"
+            >
               <div class="audit-summary" data-ui="audit-summary">
                 {{ row.detailSummary }}
               </div>

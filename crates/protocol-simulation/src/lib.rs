@@ -74,7 +74,8 @@ impl AppState {
         tokio::fs::create_dir_all(&config.data_dir)
             .await
             .with_context(|| format!("failed to create data dir {}", config.data_dir.display()))?;
-        let db_path = config.data_dir.join("protocol-simulation.db");
+        // Alpha 阶段直接重建 v1 数据基线，不迁移早期开发数据库。
+        let db_path = config.data_dir.join("protocol-simulation-v1.db");
         let connect_options = SqliteConnectOptions::new()
             .filename(&db_path)
             .create_if_missing(true)

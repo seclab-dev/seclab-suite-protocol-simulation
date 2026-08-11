@@ -97,6 +97,18 @@ const protocolCapabilities = ref<SimulationProtocolCapability[]>(
     deployable: true,
     customRuleCreatable: true,
     eventTypes: [],
+    category: "other",
+    endpoints: [
+      {
+        id: "main",
+        role: "service",
+        transport: "tcp",
+        containerPort: SIMULATION_PROTOCOL_DEFAULT_PORTS[item.value],
+        defaultHostPort: SIMULATION_PROTOCOL_DEFAULT_PORTS[item.value],
+        required: true,
+      },
+    ],
+    fields: [],
   })),
 );
 
@@ -285,6 +297,12 @@ const isDetailDrawerOpen = ref(false);
 
 /** 当前选中查看详情的规则对象 */
 const ruleDetail = ref<SimRule | null>(null);
+const ruleDetailCapability = computed(
+  () =>
+    protocolCapabilities.value.find(
+      (item) => item.protocol === ruleDetail.value?.protocol,
+    ) ?? null,
+);
 
 /** 控制部署确认弹窗（Dialog）的显示状态 */
 const isDeployDialogOpen = ref(false);
@@ -310,7 +328,8 @@ const selectedInstanceIds = ref<string[]>([]);
 /** 仿真实例部署表单模型 */
 const deployForm = ref({
   nodeId: "local",
-  port: 8080,
+  port: 8080 as number | string,
+  endpointIds: [] as string[],
   ruleId: null as number | null,
   callbackUrl: "",
 });
@@ -343,10 +362,11 @@ const instanceColumns = computed<SecLabTableColumn[]>(() => [
     slot: "rule",
   },
   {
-    prop: "listenPort",
+    prop: "endpoints",
     label: t("app.simulation.deployments.port"),
-    width: 100,
+    width: 180,
     align: "center",
+    slot: "endpoints",
   },
   {
     label: t("app.simulation.deployments.fields.status"),
@@ -382,14 +402,14 @@ const extendedRuleColumns = computed<SecLabTableColumn[]>(() => [
   {
     prop: "category",
     label: t("app.simulation.rules.fields.category"),
-    width: 120,
+    width: 160,
     align: "center",
     slot: "category",
   },
   {
     prop: "protocol",
     label: t("app.simulation.rules.fields.protocol"),
-    width: 100,
+    width: 120,
     align: "center",
     slot: "protocol",
   },
@@ -781,9 +801,25 @@ onUnmounted(() => {
 /** 辅助类型断言，安全强制转换类型便于在插槽中安全提取模型字段 */
 const toInstance = (row: unknown) => row as SimInstance;
 
+/** 按主机端口合并传输协议，例如 1053/TCP/UDP。 */
+const formatInstanceEndpoints = (instance: SimInstance) => {
+  const transportsByPort = new Map<number, string[]>();
+  for (const endpoint of instance.endpoints) {
+    const transports = transportsByPort.get(endpoint.hostPort) ?? [];
+    const transport = endpoint.transport.toUpperCase();
+    if (!transports.includes(transport)) transports.push(transport);
+    transportsByPort.set(endpoint.hostPort, transports);
+  }
+  return [...transportsByPort.entries()]
+    .map(([port, transports]) => `${port}/${transports.join("/")}`)
+    .join(", ");
+};
+
 /** 控制新建自定义规则弹窗（Dialog）的打开状态 */
 const isRuleDialogOpen = ref(false);
 const isCreatingRule = ref(false);
+const ruleEditorMode = ref<"guided" | "json">("guided");
+const advancedRuleJson = ref("{}");
 
 /** 新建诱捕规则的数据表单模型 */
 const ruleForm = ref({
@@ -838,21 +874,58 @@ const redisKeys = ref<KeyValueForm[]>([]);
 const commandResponses = ref<CommandResponseForm[]>([]);
 const credentials = ref<CredentialForm[]>([]);
 const mailMessages = ref<MailMessageForm[]>([]);
+const dynamicFieldValues = ref<Record<string, string>>({});
+
+const currentProtocolCapability = computed(() =>
+  protocolCapabilities.value.find(
+    (item) => item.protocol === ruleForm.value.protocol,
+  ),
+);
+
+const dynamicProtocolFields = computed(() =>
+  (currentProtocolCapability.value?.fields ?? []).filter(
+    (field) =>
+      ["text", "string_list", "number"].includes(field.kind) &&
+      !["banner", "server_header", "hostname", "password"].includes(field.path),
+  ),
+);
 
 const isHttpRuleForm = computed(() => ruleForm.value.protocol === "http");
 const isRedisRuleForm = computed(() => ruleForm.value.protocol === "redis");
+const isDnsRuleForm = computed(() => ruleForm.value.protocol === "dns");
+const keyValueText = (key: string) =>
+  t(
+    `app.simulation.rules.${isDnsRuleForm.value ? "dnsRecords" : "redisKeys"}.${key}`,
+  );
 const isMailRuleForm = computed(() =>
   ["smtp", "pop3", "imap"].includes(ruleForm.value.protocol),
 );
 const isCredentialRuleForm = computed(() =>
-  ["smtp", "pop3", "imap", "ssh", "ftp", "rdp"].includes(
-    ruleForm.value.protocol,
-  ),
+  (currentProtocolCapability.value?.fields.length ?? 0) > 0
+    ? currentProtocolCapability.value?.fields.some(
+        (field) => field.kind === "credentials",
+      )
+    : [
+        "smtp",
+        "pop3",
+        "imap",
+        "ssh",
+        "ftp",
+        "rdp",
+        "telnet",
+        "mysql",
+        "postgresql",
+        "ldap",
+      ].includes(ruleForm.value.protocol),
 );
 const showBannerField = computed(() =>
-  ["redis", "smtp", "pop3", "imap", "ssh", "ftp"].includes(
-    ruleForm.value.protocol,
-  ),
+  (currentProtocolCapability.value?.fields.length ?? 0) > 0
+    ? currentProtocolCapability.value?.fields.some(
+        (field) => field.path === "banner",
+      )
+    : ["redis", "smtp", "pop3", "imap", "ssh", "ftp", "telnet"].includes(
+        ruleForm.value.protocol,
+      ),
 );
 
 const currentProtocolDefaultPort = computed(() =>
@@ -884,8 +957,27 @@ const resetProtocolSpecificForm = (protocol: SimulationProtocol) => {
   ruleForm.value.serverName = "UNIX Type: L8";
   ruleForm.value.allowAnonymous = false;
   ruleForm.value.rdpFlags = protocol === "rdp" ? "1" : "";
+  dynamicFieldValues.value = {
+    server_version:
+      protocol === "mysql"
+        ? "8.0.36-seclab"
+        : protocol === "postgresql"
+          ? "16.2-seclab"
+          : "",
+    databases: "",
+    server_name: protocol === "smb" ? "SECLAB" : "",
+    domain: protocol === "smb" ? "LAB" : "",
+    shares: "",
+    base_dn: protocol === "ldap" ? "dc=lab,dc=example" : "",
+    prompt: protocol === "telnet" ? "$ " : "",
+    default_ipv4: protocol === "dns" ? "192.0.2.53" : "",
+    ttl: protocol === "dns" ? "60" : "",
+  };
   exploitPaths.value = [];
-  redisKeys.value = [];
+  redisKeys.value =
+    protocol === "dns"
+      ? [{ key: "dns.seclab.local", value: "192.0.2.53" }]
+      : [];
   commandResponses.value = [];
   credentials.value = isCredentialRuleForm.value
     ? [
@@ -915,12 +1007,16 @@ const defaultProtocolBanner = (protocol: SimulationProtocol) => {
   if (protocol === "ssh") return "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.1";
   if (protocol === "ftp") return "ProFTPD 1.3.5e Server ready.";
   if (protocol === "redis") return "Redis server ready";
+  if (protocol === "telnet") return "Embedded Linux 4.19";
   return "";
 };
 
 const defaultCredentialUsername = (protocol: SimulationProtocol) => {
   if (protocol === "ssh") return "root";
   if (protocol === "rdp") return "administrator";
+  if (protocol === "mysql") return "app";
+  if (protocol === "postgresql") return "postgres";
+  if (protocol === "ldap") return "cn=reader,dc=lab,dc=example";
   return "admin";
 };
 
@@ -943,7 +1039,16 @@ const openNewRuleDialog = () => {
     rdpFlags: "",
   };
   resetProtocolSpecificForm("http");
+  ruleEditorMode.value = "guided";
+  advancedRuleJson.value = "{}";
   isRuleDialogOpen.value = true;
+};
+
+const setRuleEditorMode = (mode: "guided" | "json") => {
+  if (mode === "json" && ruleEditorMode.value !== "json") {
+    advancedRuleJson.value = JSON.stringify(buildRuleConfig(), null, 2);
+  }
+  ruleEditorMode.value = mode;
 };
 
 watch(
@@ -1133,11 +1238,63 @@ const buildRuleConfig = () => {
     };
   }
 
+  if (protocol === "telnet") {
+    return {
+      banner: ruleForm.value.banner || undefined,
+      prompt: dynamicFieldValues.value.prompt || "$ ",
+      credentials: buildCredentialsConfig(),
+      command_responses: {},
+    };
+  }
+
+  if (protocol === "mysql" || protocol === "postgresql") {
+    return {
+      server_version: dynamicFieldValues.value.server_version || undefined,
+      credentials: buildCredentialsConfig(),
+      databases: splitDynamicList("databases"),
+      query_responses: {},
+    };
+  }
+
+  if (protocol === "smb") {
+    return {
+      server_name: dynamicFieldValues.value.server_name || "SECLAB",
+      domain: dynamicFieldValues.value.domain || "LAB",
+      shares: splitDynamicList("shares"),
+    };
+  }
+
+  if (protocol === "ldap") {
+    return {
+      base_dn: dynamicFieldValues.value.base_dn || "dc=lab,dc=example",
+      credentials: buildCredentialsConfig(),
+      entries: [],
+    };
+  }
+
+  if (protocol === "dns") {
+    return {
+      records: Object.fromEntries(
+        redisKeys.value
+          .filter((item) => item.key)
+          .map((item) => [item.key, item.value]),
+      ),
+      default_ipv4: dynamicFieldValues.value.default_ipv4 || undefined,
+      ttl: parseInt(dynamicFieldValues.value.ttl || "60", 10) || 60,
+    };
+  }
+
   return {
     flags: parseInt(ruleForm.value.rdpFlags, 10) || undefined,
     credentials: buildCredentialsConfig(),
   };
 };
+
+const splitDynamicList = (path: string) =>
+  (dynamicFieldValues.value[path] || "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
 
 /**
  * 向控制端提交创建新的诱捕仿真规则请求。
@@ -1154,7 +1311,16 @@ const handleCreateRule = async () => {
   isCreatingRule.value = true;
   isLoading.value = true;
   try {
-    const config = buildRuleConfig();
+    let config: unknown;
+    try {
+      config =
+        ruleEditorMode.value === "json"
+          ? JSON.parse(advancedRuleJson.value)
+          : buildRuleConfig();
+    } catch {
+      notificationStore.error(t("app.simulation.rules.messages.invalidJson"));
+      return;
+    }
     const res = await simulationApi.createRule({
       name: ruleForm.value.name,
       protocol: ruleForm.value.protocol,
@@ -1256,7 +1422,16 @@ const handleShowInstanceRuleDetail = async (row: SimInstance) => {
 const openDeployDialog = (row: SimRule) => {
   ruleToDeploy.value = row;
   deployForm.value.ruleId = row.id;
-  deployForm.value.port = row.defaultPort || 8080;
+  const capability = protocolCapabilities.value.find(
+    (item) => item.protocol === row.protocol,
+  );
+  deployForm.value.port =
+    row.defaultPort || capability?.endpoints[0]?.defaultHostPort || 8080;
+  deployForm.value.endpointIds = capability?.endpoints.length
+    ? capability.endpoints.map((endpoint) => endpoint.id)
+    : row.protocol === "dns"
+      ? ["dns-tcp", "dns-udp"]
+      : ["main"];
   deployForm.value.nodeId = defaultDeployNodeId.value;
   isDeployDialogOpen.value = true;
 };
@@ -1287,8 +1462,8 @@ const executeDeploy = async () => {
     );
     return;
   }
-  const portNum = parseInt(String(deployForm.value.port), 10);
-  if (isNaN(portNum) || portNum <= 0 || portNum > 65535) {
+  const port = parseInt(String(deployForm.value.port), 10);
+  if (isNaN(port) || port <= 0 || port > 65535) {
     notificationStore.error(
       t("app.simulation.deployments.messages.portInvalid"),
     );
@@ -1299,12 +1474,16 @@ const executeDeploy = async () => {
   const ruleName = deployRule
     ? getRuleName(deployRule)
     : deployForm.value.ruleId;
+  const endpointBindings = deployForm.value.endpointIds.map((endpointId) => ({
+    endpointId,
+    hostPort: port,
+  }));
 
   isDeploying.value = true;
   try {
     const res = await simulationApi.deploySimulation({
       nodeId: deployForm.value.nodeId,
-      port: portNum,
+      endpointBindings,
       ruleId: deployForm.value.ruleId,
       seclabCallbackUrl: deployForm.value.callbackUrl,
     });
@@ -1765,6 +1944,11 @@ const handleDownloadPcap = async (row: SimInstance) => {
                   </SecLabTooltip>
                 </div>
               </template>
+              <template #endpoints="{ row }">
+                <span class="mono endpoint-summary">
+                  {{ formatInstanceEndpoints(toInstance(row)) }}
+                </span>
+              </template>
               <template #forensic="{ row }">
                 <div class="forensic-cell">
                   <template v-if="isCaptureActive(toInstance(row))">
@@ -2211,6 +2395,7 @@ const handleDownloadPcap = async (row: SimInstance) => {
     <SimulationRuleDetailDialog
       :visible="isDetailDrawerOpen"
       :rule="ruleDetail"
+      :capability="ruleDetailCapability"
       @close="isDetailDrawerOpen = false"
     />
 
@@ -2246,6 +2431,25 @@ const handleDownloadPcap = async (row: SimInstance) => {
               v-model="ruleForm.defaultPort"
               type="number"
               :placeholder="String(currentProtocolDefaultPort)"
+            />
+          </div>
+          <div
+            v-for="field in dynamicProtocolFields"
+            :key="field.path"
+            class="form-group"
+          >
+            <label>
+              {{ t("app.simulation.rules.fields." + field.labelKey) }}
+              <span v-if="field.required" aria-hidden="true">*</span>
+            </label>
+            <SecLabInput
+              v-model="dynamicFieldValues[field.path]"
+              :type="field.kind === 'number' ? 'number' : 'text'"
+              :placeholder="
+                field.kind === 'string_list'
+                  ? t('app.simulation.rules.editor.listHint')
+                  : field.labelKey
+              "
             />
           </div>
           <div v-if="showBannerField" class="form-group">
@@ -2338,8 +2542,44 @@ const handleDownloadPcap = async (row: SimInstance) => {
           </div>
         </div>
 
+        <div class="section-card card-box">
+          <div class="drawer-card-header" data-slot="header">
+            <h4>{{ t("app.simulation.rules.editor.title") }}</h4>
+            <div class="flex-layout gap-layout">
+              <SecLabButton
+                :type="ruleEditorMode === 'guided' ? 'primary' : 'secondary'"
+                size="small"
+                @click="setRuleEditorMode('guided')"
+              >
+                {{ t("app.simulation.rules.editor.guided") }}
+              </SecLabButton>
+              <SecLabButton
+                :type="ruleEditorMode === 'json' ? 'primary' : 'secondary'"
+                size="small"
+                @click="setRuleEditorMode('json')"
+              >
+                {{ t("app.simulation.rules.editor.json") }}
+              </SecLabButton>
+            </div>
+          </div>
+          <div v-if="ruleEditorMode === 'json'" class="form-group">
+            <textarea
+              v-model="advancedRuleJson"
+              class="textarea-input"
+              rows="14"
+              spellcheck="false"
+            ></textarea>
+          </div>
+          <p v-else class="editor-hint">
+            {{ t("app.simulation.rules.editor.guidedHint") }}
+          </p>
+        </div>
+
         <!-- 漏洞路由添加 -->
-        <div v-if="isHttpRuleForm" class="section-card card-box">
+        <div
+          v-if="ruleEditorMode === 'guided' && isHttpRuleForm"
+          class="section-card card-box"
+        >
           <div class="drawer-card-header" data-slot="header">
             <h4>{{ t("app.simulation.rules.exploitPaths.title") }}</h4>
             <SecLabButton type="secondary" size="small" @click="addExploitPath">
@@ -2412,11 +2652,16 @@ const handleDownloadPcap = async (row: SimInstance) => {
           </div>
         </div>
 
-        <div v-if="isRedisRuleForm" class="section-card card-box">
+        <div
+          v-if="
+            ruleEditorMode === 'guided' && (isRedisRuleForm || isDnsRuleForm)
+          "
+          class="section-card card-box"
+        >
           <div class="drawer-card-header" data-slot="header">
-            <h4>{{ t("app.simulation.rules.redisKeys.title") }}</h4>
+            <h4>{{ keyValueText("title") }}</h4>
             <SecLabButton type="secondary" size="small" @click="addRedisKey">
-              + {{ t("app.simulation.rules.redisKeys.addBtn") }}
+              + {{ keyValueText("addBtn") }}
             </SecLabButton>
           </div>
           <div class="protocol-list">
@@ -2426,11 +2671,7 @@ const handleDownloadPcap = async (row: SimInstance) => {
               class="protocol-list-item card-box border-dashed"
             >
               <div class="card-title flex-layout flex-between">
-                <h5>
-                  {{ t("app.simulation.rules.redisKeys.itemTitle") }} #{{
-                    idx + 1
-                  }}
-                </h5>
+                <h5>{{ keyValueText("itemTitle") }} #{{ idx + 1 }}</h5>
                 <SecLabButton
                   type="danger"
                   size="small"
@@ -2441,21 +2682,17 @@ const handleDownloadPcap = async (row: SimInstance) => {
               </div>
               <div class="flex-layout gap-layout">
                 <div class="form-group flex-1">
-                  <label>{{ t("app.simulation.rules.redisKeys.key") }}</label>
+                  <label>{{ keyValueText("key") }}</label>
                   <SecLabInput
                     v-model="item.key"
-                    :placeholder="
-                      t('app.simulation.rules.redisKeys.keyPlaceholder')
-                    "
+                    :placeholder="keyValueText('keyPlaceholder')"
                   />
                 </div>
                 <div class="form-group flex-1">
-                  <label>{{ t("app.simulation.rules.redisKeys.value") }}</label>
+                  <label>{{ keyValueText("value") }}</label>
                   <SecLabInput
                     v-model="item.value"
-                    :placeholder="
-                      t('app.simulation.rules.redisKeys.valuePlaceholder')
-                    "
+                    :placeholder="keyValueText('valuePlaceholder')"
                   />
                 </div>
               </div>
@@ -2463,7 +2700,10 @@ const handleDownloadPcap = async (row: SimInstance) => {
           </div>
         </div>
 
-        <div v-if="isCredentialRuleForm" class="section-card card-box">
+        <div
+          v-if="ruleEditorMode === 'guided' && isCredentialRuleForm"
+          class="section-card card-box"
+        >
           <div class="drawer-card-header" data-slot="header">
             <h4>{{ t("app.simulation.rules.credentials.title") }}</h4>
             <SecLabButton type="secondary" size="small" @click="addCredential">
@@ -2529,7 +2769,10 @@ const handleDownloadPcap = async (row: SimInstance) => {
           </div>
         </div>
 
-        <div v-if="isMailRuleForm" class="section-card card-box">
+        <div
+          v-if="ruleEditorMode === 'guided' && isMailRuleForm"
+          class="section-card card-box"
+        >
           <div class="drawer-card-header" data-slot="header">
             <h4>{{ t("app.simulation.rules.mailMessages.title") }}</h4>
             <SecLabButton type="secondary" size="small" @click="addMailMessage">
@@ -2604,7 +2847,9 @@ const handleDownloadPcap = async (row: SimInstance) => {
         </div>
 
         <div
-          v-if="isRedisRuleForm || isMailRuleForm"
+          v-if="
+            ruleEditorMode === 'guided' && (isRedisRuleForm || isMailRuleForm)
+          "
           class="section-card card-box"
         >
           <div class="drawer-card-header" data-slot="header">
@@ -3127,6 +3372,10 @@ const handleDownloadPcap = async (row: SimInstance) => {
   font-size: 12px;
   color: var(--sdl-text-secondary);
   font-weight: 500;
+}
+
+.endpoint-summary {
+  white-space: nowrap;
 }
 
 .textarea-input {

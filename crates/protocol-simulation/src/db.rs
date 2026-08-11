@@ -1,13 +1,65 @@
-use super::models::{AuditLog, EventRequest, Instance, Rule, RulePackageSummary};
+use super::models::{AuditLog, EventRequest, Instance, InstanceEndpoint, Rule, RulePackageSummary};
 use super::rule_package::ImportedRulePackage;
 use anyhow::{Context, anyhow};
 use sqlx::SqlitePool;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use tokio::sync::{mpsc, oneshot};
 
 const AUDIT_LOG_QUEUE_CAPACITY: usize = 4_096;
 const AUDIT_LOG_BATCH_SIZE: usize = 128;
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct InstanceRow {
+    id: String,
+    rule_id: String,
+    rule_name: String,
+    protocol: String,
+    callback_token: String,
+    status: String,
+    workload_id: Option<String>,
+    error_message: Option<String>,
+    pcap_status: String,
+    pcap_start_time: Option<i64>,
+    pcap_capture_id: Option<String>,
+    pcap_file_path: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct AuditLogRow {
+    id: i64,
+    event_id: String,
+    instance_id: String,
+    endpoint_id: String,
+    event_type: String,
+    summary: String,
+    client_ip: String,
+    client_port: i64,
+    payload_hex: Option<String>,
+    metadata_json: String,
+    timestamp: String,
+}
+
+impl AuditLogRow {
+    fn into_log(self) -> anyhow::Result<AuditLog> {
+        Ok(AuditLog {
+            id: self.id,
+            event_id: self.event_id,
+            instance_id: self.instance_id,
+            endpoint_id: self.endpoint_id,
+            event_type: self.event_type,
+            summary: self.summary,
+            client_ip: self.client_ip,
+            client_port: self.client_port,
+            payload_hex: self.payload_hex,
+            metadata: serde_json::from_str(&self.metadata_json)
+                .context("failed to decode audit log metadata")?,
+            timestamp: self.timestamp,
+        })
+    }
+}
 
 /// 将并发审计事件串行化并按批次写入 SQLite。
 #[derive(Clone)]
@@ -177,8 +229,7 @@ pub async fn init(db: &SqlitePool) -> anyhow::Result<()> {
             rule_id TEXT NOT NULL,
             rule_name TEXT NOT NULL,
             protocol TEXT NOT NULL,
-            host_port INTEGER NOT NULL,
-            container_port INTEGER NOT NULL,
+            callback_token TEXT NOT NULL,
             status TEXT NOT NULL,
             workload_id TEXT,
             error_message TEXT,
@@ -195,27 +246,35 @@ pub async fn init(db: &SqlitePool) -> anyhow::Result<()> {
     .execute(db)
     .await?;
 
-    ensure_column(
-        db,
-        "instances",
-        "pcap_status",
-        "TEXT NOT NULL DEFAULT 'idle'",
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS instance_endpoints (
+            instance_id TEXT NOT NULL,
+            endpoint_id TEXT NOT NULL,
+            transport TEXT NOT NULL CHECK (transport IN ('tcp', 'udp')),
+            host_port INTEGER NOT NULL,
+            container_port INTEGER NOT NULL,
+            PRIMARY KEY(instance_id, endpoint_id),
+            FOREIGN KEY(instance_id) REFERENCES instances(id) ON DELETE CASCADE
+        );
+        "#,
     )
+    .execute(db)
     .await?;
-    ensure_column(db, "instances", "pcap_start_time", "INTEGER").await?;
-    ensure_column(db, "instances", "pcap_capture_id", "TEXT").await?;
-    ensure_column(db, "instances", "pcap_file_path", "TEXT").await?;
 
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS audit_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id TEXT NOT NULL UNIQUE,
             instance_id TEXT NOT NULL,
+            endpoint_id TEXT NOT NULL,
             event_type TEXT NOT NULL,
             summary TEXT NOT NULL,
             client_ip TEXT NOT NULL,
             client_port INTEGER NOT NULL,
             payload_hex TEXT,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
             timestamp TEXT NOT NULL,
             FOREIGN KEY(instance_id) REFERENCES instances(id) ON DELETE CASCADE
         );
@@ -227,6 +286,11 @@ pub async fn init(db: &SqlitePool) -> anyhow::Result<()> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_instances_status ON instances(status);")
         .execute(db)
         .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_endpoint_binding ON instance_endpoints(transport, host_port);",
+    )
+    .execute(db)
+    .await?;
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_logs_instance_id ON audit_logs(instance_id, id DESC);",
     )
@@ -278,17 +342,23 @@ pub async fn import_rule_package(
     let mut tx = db.begin().await.context("failed to begin rule import")?;
     let imported_at = chrono::Utc::now().to_rfc3339();
 
-    sqlx::query("DELETE FROM rules WHERE id LIKE 'sim-rule-%'")
-        .execute(&mut *tx)
-        .await
-        .context("failed to remove previous packaged rules")?;
-
+    let imported_rule_ids = package
+        .rules
+        .iter()
+        .map(|rule| rule.id.as_str())
+        .collect::<HashSet<_>>();
     for rule in &package.rules {
         let config_json = rule_config_with_name_en(&rule.config_json, &rule.name_en)?;
         sqlx::query(
             r#"
             INSERT INTO rules (id, name, protocol, default_port, config_json, created_at, updated_at)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+            ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                protocol = excluded.protocol,
+                default_port = excluded.default_port,
+                config_json = excluded.config_json,
+                updated_at = excluded.updated_at
             "#,
         )
         .bind(&rule.id)
@@ -300,6 +370,28 @@ pub async fn import_rule_package(
         .execute(&mut *tx)
         .await
         .with_context(|| format!("failed to import rule {}", rule.id))?;
+    }
+
+    let previous_rule_ids =
+        sqlx::query_scalar::<_, String>("SELECT id FROM rules WHERE id LIKE 'sim-rule-%'")
+            .fetch_all(&mut *tx)
+            .await
+            .context("failed to list previous packaged rules")?;
+    for rule_id in previous_rule_ids {
+        if imported_rule_ids.contains(rule_id.as_str()) {
+            continue;
+        }
+        sqlx::query(
+            r#"
+            DELETE FROM rules
+             WHERE id = ?1
+               AND NOT EXISTS (SELECT 1 FROM instances WHERE rule_id = ?1)
+            "#,
+        )
+        .bind(&rule_id)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("failed to remove stale packaged rule {rule_id}"))?;
     }
 
     sqlx::query(
@@ -384,9 +476,9 @@ pub async fn delete_rule(db: &SqlitePool, id: &str) -> anyhow::Result<bool> {
 }
 
 pub async fn list_instances(db: &SqlitePool) -> anyhow::Result<Vec<Instance>> {
-    sqlx::query_as::<_, Instance>(
+    let rows = sqlx::query_as::<_, InstanceRow>(
         r#"
-        SELECT id, rule_id, rule_name, protocol, host_port, container_port, status, workload_id,
+        SELECT id, rule_id, rule_name, protocol, callback_token, status, workload_id,
                error_message, pcap_status, pcap_start_time, pcap_capture_id, pcap_file_path,
                created_at, updated_at
           FROM instances
@@ -395,35 +487,60 @@ pub async fn list_instances(db: &SqlitePool) -> anyhow::Result<Vec<Instance>> {
     )
     .fetch_all(db)
     .await
-    .context("failed to list instances")
+    .context("failed to list instances")?;
+    let mut instances = Vec::with_capacity(rows.len());
+    for row in rows {
+        instances.push(hydrate_instance(db, row).await?);
+    }
+    Ok(instances)
 }
 
 pub async fn insert_instance_if_port_available(
     db: &SqlitePool,
     instance: &Instance,
 ) -> anyhow::Result<bool> {
-    let result = sqlx::query(
+    let mut transaction = db
+        .begin()
+        .await
+        .context("failed to begin instance insert")?;
+    for endpoint in &instance.endpoints {
+        let occupied = sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                  FROM instance_endpoints endpoint
+                  JOIN instances instance ON instance.id = endpoint.instance_id
+                 WHERE endpoint.transport = ?1
+                   AND endpoint.host_port = ?2
+                   AND instance.status IN ('deploying', 'running')
+            )
+            "#,
+        )
+        .bind(&endpoint.transport)
+        .bind(endpoint.host_port)
+        .fetch_one(&mut *transaction)
+        .await
+        .context("failed to check endpoint availability")?;
+        if occupied {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+    }
+    sqlx::query(
         r#"
         INSERT INTO instances (
-            id, rule_id, rule_name, protocol, host_port, container_port,
+            id, rule_id, rule_name, protocol, callback_token,
             status, workload_id, error_message, pcap_status, pcap_start_time, pcap_capture_id, pcap_file_path,
             created_at, updated_at
         )
-        SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15
-         WHERE NOT EXISTS (
-            SELECT 1
-              FROM instances
-             WHERE host_port = ?16
-               AND status IN ('deploying', 'running')
-         )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
         "#,
     )
     .bind(&instance.id)
     .bind(&instance.rule_id)
     .bind(&instance.rule_name)
     .bind(&instance.protocol)
-    .bind(instance.host_port)
-    .bind(instance.container_port)
+    .bind(&instance.callback_token)
     .bind(&instance.status)
     .bind(&instance.workload_id)
     .bind(&instance.error_message)
@@ -433,17 +550,37 @@ pub async fn insert_instance_if_port_available(
     .bind(&instance.pcap_file_path)
     .bind(&instance.created_at)
     .bind(&instance.updated_at)
-    .bind(instance.host_port)
-    .execute(db)
+    .execute(&mut *transaction)
     .await
     .context("failed to insert instance")?;
-    Ok(result.rows_affected() == 1)
+    for endpoint in &instance.endpoints {
+        sqlx::query(
+            r#"
+            INSERT INTO instance_endpoints (
+                instance_id, endpoint_id, transport, host_port, container_port
+            ) VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+        )
+        .bind(&instance.id)
+        .bind(&endpoint.endpoint_id)
+        .bind(&endpoint.transport)
+        .bind(endpoint.host_port)
+        .bind(endpoint.container_port)
+        .execute(&mut *transaction)
+        .await
+        .context("failed to insert instance endpoint")?;
+    }
+    transaction
+        .commit()
+        .await
+        .context("failed to commit instance insert")?;
+    Ok(true)
 }
 
 pub async fn get_instance(db: &SqlitePool, id: &str) -> anyhow::Result<Option<Instance>> {
-    sqlx::query_as::<_, Instance>(
+    let row = sqlx::query_as::<_, InstanceRow>(
         r#"
-        SELECT id, rule_id, rule_name, protocol, host_port, container_port, status, workload_id,
+        SELECT id, rule_id, rule_name, protocol, callback_token, status, workload_id,
                error_message, pcap_status, pcap_start_time, pcap_capture_id, pcap_file_path,
                created_at, updated_at
           FROM instances
@@ -453,7 +590,43 @@ pub async fn get_instance(db: &SqlitePool, id: &str) -> anyhow::Result<Option<In
     .bind(id)
     .fetch_optional(db)
     .await
-    .context("failed to fetch instance")
+    .context("failed to fetch instance")?;
+    match row {
+        Some(row) => Ok(Some(hydrate_instance(db, row).await?)),
+        None => Ok(None),
+    }
+}
+
+async fn hydrate_instance(db: &SqlitePool, row: InstanceRow) -> anyhow::Result<Instance> {
+    let endpoints = sqlx::query_as::<_, InstanceEndpoint>(
+        r#"
+        SELECT instance_id, endpoint_id, transport, host_port, container_port
+          FROM instance_endpoints
+         WHERE instance_id = ?1
+         ORDER BY endpoint_id
+        "#,
+    )
+    .bind(&row.id)
+    .fetch_all(db)
+    .await
+    .context("failed to list instance endpoints")?;
+    Ok(Instance {
+        id: row.id,
+        rule_id: row.rule_id,
+        rule_name: row.rule_name,
+        protocol: row.protocol,
+        endpoints,
+        callback_token: row.callback_token,
+        status: row.status,
+        workload_id: row.workload_id,
+        error_message: row.error_message,
+        pcap_status: row.pcap_status,
+        pcap_start_time: row.pcap_start_time,
+        pcap_capture_id: row.pcap_capture_id,
+        pcap_file_path: row.pcap_file_path,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    })
 }
 
 pub async fn delete_instance(db: &SqlitePool, id: &str) -> anyhow::Result<bool> {
@@ -557,36 +730,56 @@ async fn insert_instance_log_batch(
         }
     };
     let mut logs = Vec::with_capacity(events.len());
+    let mut inserted_count = 0usize;
     for event in events {
         let timestamp = event
             .timestamp
             .clone()
             .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
-        let log = sqlx::query_as::<_, AuditLog>(
+        let metadata_json = serde_json::to_string(&event.metadata)
+            .context("failed to encode audit log metadata")
+            .map_err(AuditLogWriteError::Internal)?;
+        let inserted = sqlx::query(
             r#"
-            INSERT INTO audit_logs (
-                instance_id, event_type, summary, client_ip, client_port, payload_hex, timestamp
+            INSERT OR IGNORE INTO audit_logs (
+                event_id, instance_id, endpoint_id, event_type, summary, client_ip, client_port,
+                payload_hex, metadata_json, timestamp
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-            RETURNING id, instance_id, event_type, summary, client_ip, client_port,
-                      payload_hex, timestamp
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             "#,
         )
+        .bind(&event.event_id)
         .bind(instance_id)
+        .bind(&event.endpoint_id)
         .bind(&event.event_type)
         .bind(&event.summary)
         .bind(&event.client_ip)
         .bind(i64::from(event.client_port))
         .bind(&event.payload_hex)
+        .bind(metadata_json)
         .bind(timestamp)
-        .fetch_one(&mut *transaction)
+        .execute(&mut *transaction)
         .await
         .context("failed to insert audit log")
         .map_err(AuditLogWriteError::Internal)?;
-        logs.push(log);
+        inserted_count += inserted.rows_affected() as usize;
+        let log = sqlx::query_as::<_, AuditLogRow>(
+            r#"
+            SELECT id, event_id, instance_id, endpoint_id, event_type, summary, client_ip,
+                   client_port, payload_hex, metadata_json, timestamp
+              FROM audit_logs
+             WHERE event_id = ?1
+            "#,
+        )
+        .bind(&event.event_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .context("failed to fetch persisted audit log")
+        .map_err(AuditLogWriteError::Internal)?;
+        logs.push(log.into_log().map_err(AuditLogWriteError::Internal)?);
     }
 
-    let total_count = current_count.saturating_add(logs.len());
+    let total_count = current_count.saturating_add(inserted_count);
     let overflow = total_count.saturating_sub(max_logs_per_instance);
     if overflow > 0 {
         sqlx::query(
@@ -629,10 +822,10 @@ pub async fn list_instance_logs(
             .await
             .context("failed to count instance audit logs")?;
     let offset = i64::from(page.saturating_sub(1)) * i64::from(page_size);
-    let records = sqlx::query_as::<_, AuditLog>(
+    let records = sqlx::query_as::<_, AuditLogRow>(
         r#"
-        SELECT id, instance_id, event_type, summary, client_ip, client_port,
-               payload_hex, timestamp
+        SELECT id, event_id, instance_id, endpoint_id, event_type, summary, client_ip, client_port,
+               payload_hex, metadata_json, timestamp
           FROM audit_logs
          WHERE instance_id = ?1
          ORDER BY id DESC
@@ -645,28 +838,13 @@ pub async fn list_instance_logs(
     .fetch_all(db)
     .await
     .context("failed to list instance audit logs")?;
-    Ok((total, records))
-}
-
-async fn ensure_column(
-    db: &SqlitePool,
-    table: &str,
-    column: &str,
-    definition: &str,
-) -> anyhow::Result<()> {
-    let columns =
-        sqlx::query_as::<_, (String,)>(&format!("SELECT name FROM pragma_table_info('{table}')"))
-            .fetch_all(db)
-            .await?;
-    if columns.iter().any(|(name,)| name == column) {
-        return Ok(());
-    }
-    sqlx::query(&format!(
-        "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+    Ok((
+        total,
+        records
+            .into_iter()
+            .map(AuditLogRow::into_log)
+            .collect::<anyhow::Result<Vec<_>>>()?,
     ))
-    .execute(db)
-    .await?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -675,12 +853,16 @@ mod tests {
 
     fn event(instance_id: &str, index: usize) -> EventRequest {
         EventRequest {
+            schema_version: 1,
+            event_id: format!("event-{instance_id}-{index}"),
             instance_id: instance_id.to_string(),
+            endpoint_id: "main".to_string(),
             event_type: "connection".to_string(),
             summary: format!("event {index}"),
             client_ip: "192.0.2.1".to_string(),
             client_port: 12_345,
             payload_hex: None,
+            metadata: serde_json::json!({"index": index}),
             timestamp: None,
         }
     }
@@ -691,8 +873,14 @@ mod tests {
             rule_id: "rule-1".to_string(),
             rule_name: "HTTP simulation".to_string(),
             protocol: "http".to_string(),
-            host_port: port,
-            container_port: port,
+            endpoints: vec![InstanceEndpoint {
+                instance_id: id.to_string(),
+                endpoint_id: "main".to_string(),
+                transport: "tcp".to_string(),
+                host_port: port,
+                container_port: 80,
+            }],
+            callback_token: "test-token".to_string(),
             status: "deploying".to_string(),
             workload_id: None,
             error_message: None,
@@ -842,6 +1030,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn duplicate_event_id_is_idempotent() {
+        let db = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        init(&db).await.unwrap();
+        insert_rule_and_instance(&db, "instance-1", 8080).await;
+        let event = event("instance-1", 1);
+        let first = insert_instance_log_batch(&db, "instance-1", &[&event], 10_000, None)
+            .await
+            .unwrap();
+        let second = insert_instance_log_batch(&db, "instance-1", &[&event], 10_000, Some(first.1))
+            .await
+            .unwrap();
+
+        assert_eq!(first.0[0].id, second.0[0].id);
+        assert_eq!(second.1, 1);
+    }
+
+    #[tokio::test]
     async fn active_instance_reserves_host_port_until_terminal_state() {
         let db = SqlitePool::connect("sqlite::memory:").await.unwrap();
         init(&db).await.unwrap();
@@ -877,5 +1082,65 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn tcp_and_udp_can_share_the_same_numeric_host_port() {
+        let db = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        init(&db).await.unwrap();
+        sqlx::query(
+            "INSERT INTO rules (id, name, protocol, default_port, config_json) \
+             VALUES ('rule-1', 'DNS simulation', 'dns', 1053, '{}')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let mut tcp = instance("dns-tcp-instance", 1053);
+        tcp.protocol = "dns".to_string();
+        assert!(insert_instance_if_port_available(&db, &tcp).await.unwrap());
+
+        let mut udp = instance("dns-udp-instance", 1053);
+        udp.protocol = "dns".to_string();
+        udp.endpoints[0].transport = "udp".to_string();
+        assert!(insert_instance_if_port_available(&db, &udp).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn rule_package_refresh_does_not_orphan_running_workloads() {
+        let db = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        init(&db).await.unwrap();
+        sqlx::query(
+            "INSERT INTO rules (id, name, protocol, default_port, config_json) \
+             VALUES ('sim-rule-9', 'Old rule', 'http', 80, '{}')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let mut active = instance("instance-1", 8080);
+        active.rule_id = "sim-rule-9".to_string();
+        active.rule_name = "Old rule".to_string();
+        assert!(
+            insert_instance_if_port_available(&db, &active)
+                .await
+                .unwrap()
+        );
+
+        import_rule_package(
+            &db,
+            &ImportedRulePackage {
+                package_id: "seclab-sim-rules".to_string(),
+                version: "0.1.0-alpha.3".to_string(),
+                ruleset_format_version: 1,
+                min_seclab_version: "0.1.0-alpha.3".to_string(),
+                generated_at: "2026-08-11T00:00:00Z".to_string(),
+                rules: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(get_instance(&db, "instance-1").await.unwrap().is_some());
+        assert!(get_rule(&db, "sim-rule-9").await.unwrap().is_some());
     }
 }

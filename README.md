@@ -22,7 +22,7 @@ cargo run -p protocol-simulation
 cargo run -p protocol-simulation-engine
 ```
 
-API 服务默认监听 `8080`，数据目录为 `/data`，可通过 `SECLAB_SUITE_DATA_DIR` 覆盖。engine 默认监听 `SECLAB_SIM_PORT`。
+API 服务默认监听 `8080`，数据目录为 `/data`，可通过 `SECLAB_SUITE_DATA_DIR` 覆盖。engine 只读取 Agent 注入的 `SECLAB_WORKLOAD_CONFIG_JSON` v1 启动描述，并按其中的具名端点监听固定容器端口。
 
 ## 镜像构建
 
@@ -39,8 +39,8 @@ API 服务默认监听 `8080`，数据目录为 `/data`，可通过 `SECLAB_SUIT
 也可以显式传入镜像标签：
 
 ```bash
-./scripts/build-image.sh 0.1.0-alpha.1
-./scripts/build-engine-image.sh 0.1.0-alpha.1
+./scripts/build-image.sh 0.1.0-alpha.2
+./scripts/build-engine-image.sh 0.1.0-alpha.2
 ```
 
 默认镜像名：
@@ -53,6 +53,8 @@ API 服务默认监听 `8080`，数据目录为 `/data`，可通过 `SECLAB_SUIT
 套件 API 容器只维护套件状态和调用 Agent。协议仿真实例由 Agent 通过 suite workload API 拉起 engine 容器，容器生命周期和 PCAP 取证归属当前节点 Agent。
 
 规则包导入、实例部署、下线和取证接口由套件 API 提供；主控只负责安装套件、代理入口、注入运行配置和展示统一通知。
+
+当前 v1 能力目录覆盖 HTTP、Redis、SMTP、POP3、IMAP、SSH、FTP、RDP、Telnet、MySQL、PostgreSQL、SMB、LDAP 和 DNS。DNS 规则同时声明 53/TCP 与 53/UDP 容器端点；部署时只需配置一个主机端口，默认以主机端口 1053 同时发布 TCP 与 UDP。实例、Agent workload、整工作负载 PCAP、engine 启动描述和审计事件均使用具名端点。
 
 SecLab 会把 `/run/seclab-agent/runtime.json` 及实例令牌以只读方式注入套件。套件 API 根据描述自动连接本地 UDS 或节点 mTLS HTTPS，不读取 Agent mode，也不接受客户端自行指定套件实例身份。
 

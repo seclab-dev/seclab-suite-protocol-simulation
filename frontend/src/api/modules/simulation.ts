@@ -6,7 +6,13 @@ export type SimulationProtocol =
   | "imap"
   | "ssh"
   | "ftp"
-  | "rdp";
+  | "rdp"
+  | "telnet"
+  | "mysql"
+  | "postgresql"
+  | "smb"
+  | "ldap"
+  | "dns";
 
 export const SIMULATION_PROTOCOL_OPTIONS: {
   value: SimulationProtocol;
@@ -20,6 +26,12 @@ export const SIMULATION_PROTOCOL_OPTIONS: {
   { value: "ssh", label: "SSH" },
   { value: "ftp", label: "FTP" },
   { value: "rdp", label: "RDP" },
+  { value: "telnet", label: "TELNET" },
+  { value: "mysql", label: "MYSQL" },
+  { value: "postgresql", label: "POSTGRESQL" },
+  { value: "smb", label: "SMB" },
+  { value: "ldap", label: "LDAP" },
+  { value: "dns", label: "DNS" },
 ];
 
 export const SIMULATION_PROTOCOL_DEFAULT_PORTS: Record<
@@ -34,7 +46,30 @@ export const SIMULATION_PROTOCOL_DEFAULT_PORTS: Record<
   ssh: 22,
   ftp: 21,
   rdp: 3389,
+  telnet: 23,
+  mysql: 3306,
+  postgresql: 5432,
+  smb: 445,
+  ldap: 389,
+  dns: 1053,
 };
+
+export interface SimulationEndpointCapability {
+  id: string;
+  role: string;
+  transport: "tcp" | "udp";
+  containerPort: number;
+  defaultHostPort: number;
+  required: boolean;
+}
+
+export interface SimulationFieldCapability {
+  path: string;
+  labelKey: string;
+  kind: string;
+  required: boolean;
+  secret: boolean;
+}
 
 export interface SimulationProtocolCapability {
   protocol: SimulationProtocol;
@@ -43,6 +78,9 @@ export interface SimulationProtocolCapability {
   deployable: boolean;
   customRuleCreatable: boolean;
   eventTypes: string[];
+  category: string;
+  endpoints: SimulationEndpointCapability[];
+  fields: SimulationFieldCapability[];
 }
 
 export interface SimRule {
@@ -67,6 +105,7 @@ export interface SimInstance {
   ruleName: string;
   protocol: string;
   listenPort: number;
+  endpoints: SuiteEndpoint[];
   status: "active" | "inactive" | "error";
   errorMessage?: string;
   pcapStatus: "idle" | "capturing" | "ready";
@@ -83,6 +122,8 @@ export interface SimLog {
   clientIp: string;
   clientPort: number;
   eventType: string;
+  endpointId: string;
+  metadata: Record<string, unknown>;
   detailSummary: string;
   payloadHex?: string;
   pcapFilePath?: string;
@@ -115,7 +156,10 @@ export interface CreateRuleReq {
 
 export interface DeploySimReq {
   nodeId: string;
-  port: number;
+  endpointBindings: Array<{
+    endpointId: string;
+    hostPort: number;
+  }>;
   ruleId: number;
   seclabCallbackUrl: string;
 }
@@ -147,7 +191,7 @@ type SuiteInstance = {
   ruleId: string;
   ruleName: string;
   protocol: string;
-  hostPort: number;
+  endpoints: SuiteEndpoint[];
   status: string;
   errorMessage?: string | null;
   pcapStatus?: "idle" | "capturing" | "ready";
@@ -157,20 +201,31 @@ type SuiteInstance = {
   updatedAt: string;
 };
 
+type SuiteEndpoint = {
+  instanceId: string;
+  endpointId: string;
+  transport: "tcp" | "udp";
+  hostPort: number;
+  containerPort: number;
+};
+
 type SuiteLog = {
   id: number;
   instanceId: string;
   eventType: string;
+  endpointId: string;
   summary: string;
   clientIp: string;
   clientPort: number;
   payloadHex?: string | null;
+  metadata: Record<string, unknown>;
   pcapFilePath?: string | null;
   timestamp: string;
 };
 
 const ruleIdToBackend = new Map<number, string>();
 const backendRuleIdToUi = new Map<string, number>();
+let capabilityCache: SimulationProtocolCapability[] = [];
 
 async function request<T>(
   url: string,
@@ -235,8 +290,9 @@ function parseConfig(rule: SuiteRule) {
 
 function mapRule(rule: SuiteRule): SimRule {
   const parsed = parseConfig(rule);
+  const id = rememberRuleId(rule.id);
   return {
-    id: rememberRuleId(rule.id),
+    id,
     name: rule.name,
     nameEn: parsed.nameEn || rule.name,
     cve: parsed.cve,
@@ -252,13 +308,17 @@ function mapRule(rule: SuiteRule): SimRule {
 }
 
 function mapInstance(instance: SuiteInstance): SimInstance {
+  const mainEndpoint =
+    instance.endpoints.find((endpoint) => endpoint.endpointId === "main") ||
+    instance.endpoints[0];
   return {
     instanceId: instance.id,
     nodeId: "local",
     ruleId: rememberRuleId(instance.ruleId),
     ruleName: instance.ruleName,
     protocol: instance.protocol,
-    listenPort: instance.hostPort,
+    listenPort: mainEndpoint?.hostPort ?? 0,
+    endpoints: instance.endpoints,
     status:
       instance.status === "running" || instance.status === "deploying"
         ? "active"
@@ -282,6 +342,8 @@ function mapLog(log: SuiteLog): SimLog {
     clientIp: log.clientIp,
     clientPort: log.clientPort,
     eventType: log.eventType,
+    endpointId: log.endpointId,
+    metadata: log.metadata,
     detailSummary: log.summary,
     payloadHex: log.payloadHex || undefined,
     pcapFilePath: log.pcapFilePath || undefined,
@@ -304,17 +366,30 @@ function mapPackage(pkg: SuitePackage): SimRulePackage {
 
 export const simulationApi = {
   async listProtocols(): Promise<ApiEnvelope<SimulationProtocolCapability[]>> {
-    return {
-      success: true,
-      data: SIMULATION_PROTOCOL_OPTIONS.map((item) => ({
-        protocol: item.value,
-        label: item.label,
-        defaultPort: SIMULATION_PROTOCOL_DEFAULT_PORTS[item.value],
-        deployable: true,
-        customRuleCreatable: true,
-        eventTypes: [],
-      })),
-    } satisfies ApiEnvelope<SimulationProtocolCapability[]>;
+    const res = await request<{
+      schemaVersion: number;
+      protocols: Array<{
+        protocol: SimulationProtocol;
+        label: string;
+        category: string;
+        endpoints: SimulationEndpointCapability[];
+        fields: SimulationFieldCapability[];
+        eventTypes: string[];
+      }>;
+    }>(apiUrl("/api/capabilities"));
+    if (!res.success || !res.data || res.data.schemaVersion !== 1)
+      return fail(res);
+    capabilityCache = res.data.protocols.map((item) => ({
+      ...item,
+      defaultPort:
+        item.endpoints.find((endpoint) => endpoint.id === "main")
+          ?.defaultHostPort ??
+        item.endpoints[0]?.defaultHostPort ??
+        0,
+      deployable: item.endpoints.length > 0,
+      customRuleCreatable: true,
+    }));
+    return { success: true, data: capabilityCache };
   },
   async createRule(data: CreateRuleReq): Promise<ApiEnvelope<SimRule>> {
     const res = await request<SuiteRule>(apiUrl("/api/rules"), {
@@ -380,7 +455,10 @@ export const simulationApi = {
     const res = await request<SuiteInstance>(apiUrl("/api/instances/deploy"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ruleId: backendRuleId, hostPort: data.port }),
+      body: JSON.stringify({
+        ruleId: backendRuleId,
+        endpointBindings: data.endpointBindings,
+      }),
     });
     return res.success && res.data
       ? { success: true, data: mapInstance(res.data) }

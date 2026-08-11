@@ -33,15 +33,16 @@ pub struct CreateRuleRequest {
     pub config_json: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Instance {
     pub id: String,
     pub rule_id: String,
     pub rule_name: String,
     pub protocol: String,
-    pub host_port: i64,
-    pub container_port: i64,
+    pub endpoints: Vec<InstanceEndpoint>,
+    #[serde(skip)]
+    pub callback_token: String,
     pub status: String,
     pub workload_id: Option<String>,
     pub error_message: Option<String>,
@@ -53,30 +54,53 @@ pub struct Instance {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct InstanceEndpoint {
+    pub instance_id: String,
+    pub endpoint_id: String,
+    pub transport: String,
+    pub host_port: i64,
+    pub container_port: i64,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeployInstanceRequest {
     pub rule_id: String,
+    pub endpoint_bindings: Vec<EndpointBindingRequest>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EndpointBindingRequest {
+    pub endpoint_id: String,
     pub host_port: u16,
 }
 
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuditLog {
     pub id: i64,
+    pub event_id: String,
     pub instance_id: String,
+    pub endpoint_id: String,
     pub event_type: String,
     pub summary: String,
     pub client_ip: String,
     pub client_port: i64,
     pub payload_hex: Option<String>,
+    pub metadata: serde_json::Value,
     pub timestamp: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EventRequest {
+    pub schema_version: u32,
+    pub event_id: String,
     pub instance_id: String,
+    pub endpoint_id: String,
     pub event_type: String,
     pub summary: String,
     #[serde(default = "default_client_ip")]
@@ -85,6 +109,8 @@ pub struct EventRequest {
     pub client_port: u16,
     #[serde(default)]
     pub payload_hex: Option<String>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
     #[serde(default)]
     pub timestamp: Option<String>,
 }

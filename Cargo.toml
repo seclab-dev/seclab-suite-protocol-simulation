@@ -6,7 +6,7 @@ resolver = "3"
 edition = "2024"
 
 [workspace.dependencies]
-seclab-suite-runtime-sdk = { git = "https://github.com/seclab-dev/seclab-suite-runtime-sdk.git", tag = "rust-0.1.0-alpha.1" }
+seclab-suite-runtime-sdk = { git = "https://github.com/seclab-dev/seclab-suite-runtime-sdk.git", tag = "rust-0.1.0-alpha.2" }
 
 anyhow = "1.0"
 axum = { version = "0.8", features = ["macros", "multipart"] }

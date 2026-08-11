@@ -1,56 +1,92 @@
 mod simulation;
 
 use anyhow::Context;
-use protocol_simulation_common::DEFAULT_EVENT_CALLBACK_URL;
+use protocol_simulation_common::{
+    BoundEndpoint, EngineLaunchConfig, ProtocolId, TransportProtocol,
+};
 use std::net::SocketAddr;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::oneshot;
+use tokio::task::JoinSet;
 use tokio::time::{Duration, timeout};
-
-#[derive(Debug, Clone)]
-struct EngineConfig {
-    protocol: String,
-    rule_id: String,
-    rule_name: Option<String>,
-    instance_id: String,
-    callback_url: String,
-    node_id: String,
-    port: u16,
-    config_json: serde_json::Value,
-}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             std::env::var("RUST_LOG")
-                .unwrap_or_else(|_| "protocol_simulation_engine=info,tower_http=info".to_string()),
+                .unwrap_or_else(|_| "protocol_simulation_engine=info".to_string()),
         )
         .init();
 
-    let config = EngineConfig::from_env()?;
+    let config = launch_config_from_env()?;
+    if config.schema_version != 1 {
+        anyhow::bail!(
+            "unsupported engine launch schemaVersion: {}",
+            config.schema_version
+        );
+    }
+    let endpoints = validated_endpoints(&config)?;
     tracing::info!(
-        protocol = config.protocol,
+        protocol = config.protocol.as_str(),
         rule_id = config.rule_id,
         instance_id = config.instance_id,
-        port = config.port,
+        endpoint_count = endpoints.len(),
         "starting protocol simulation engine"
     );
-    let addr: SocketAddr = format!("0.0.0.0:{}", config.port)
-        .parse()
-        .context("invalid simulation bind address")?;
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("failed to bind simulation listener on {addr}"))?;
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let mut simulation = Box::pin(run_simulation(config, listener, shutdown_rx));
+    simulation::initialize_reporter(
+        config.callback_url.clone(),
+        config.callback_token.clone(),
+        config.instance_id.clone(),
+        config.endpoints.clone(),
+    )?;
+
+    let mut simulations = JoinSet::new();
+    let mut shutdown_senders = Vec::with_capacity(endpoints.len());
+    for endpoint in endpoints {
+        let addr: SocketAddr = format!("0.0.0.0:{}", endpoint.container_port)
+            .parse()
+            .context("invalid simulation bind address")?;
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        shutdown_senders.push(shutdown_tx);
+        match endpoint.transport {
+            TransportProtocol::Tcp => {
+                let listener = TcpListener::bind(addr)
+                    .await
+                    .with_context(|| format!("failed to bind TCP simulation listener on {addr}"))?;
+                simulations.spawn(run_tcp_simulation(
+                    config.clone(),
+                    endpoint,
+                    listener,
+                    shutdown_rx,
+                ));
+            }
+            TransportProtocol::Udp => {
+                let socket = UdpSocket::bind(addr)
+                    .await
+                    .with_context(|| format!("failed to bind UDP simulation listener on {addr}"))?;
+                simulations.spawn(run_udp_simulation(
+                    config.clone(),
+                    endpoint,
+                    socket,
+                    shutdown_rx,
+                ));
+            }
+        }
+    }
 
     tokio::select! {
-        result = &mut simulation => result,
+        result = simulations.join_next() => {
+            signal_simulations(shutdown_senders);
+            match result {
+                Some(result) => result.context("simulation endpoint task failed")?,
+                None => Ok(()),
+            }
+        },
         _ = shutdown_signal() => {
             tracing::info!("shutdown signal received; waiting up to 5 seconds for graceful engine shutdown");
-            let _ = shutdown_tx.send(());
-            match timeout(Duration::from_secs(5), &mut simulation).await {
+            signal_simulations(shutdown_senders);
+            match timeout(Duration::from_secs(5), drain_simulations(&mut simulations)).await {
                 Ok(result) => result,
                 Err(_) => {
                     tracing::warn!("graceful engine shutdown timed out after 5 seconds");
@@ -61,118 +97,266 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-async fn run_simulation(
-    config: EngineConfig,
+fn validated_endpoints(config: &EngineLaunchConfig) -> anyhow::Result<Vec<BoundEndpoint>> {
+    if config.endpoints.is_empty() {
+        anyhow::bail!("simulation launch config does not contain an endpoint");
+    }
+    if config.protocol != ProtocolId::Dns
+        && let Some(endpoint) = config
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.transport != TransportProtocol::Tcp)
+    {
+        anyhow::bail!(
+            "protocol {} endpoint {} requires an unsupported engine transport",
+            config.protocol.as_str(),
+            endpoint.endpoint_id
+        );
+    }
+    Ok(config.endpoints.clone())
+}
+
+fn signal_simulations(senders: Vec<oneshot::Sender<()>>) {
+    for sender in senders {
+        let _ = sender.send(());
+    }
+}
+
+async fn drain_simulations(simulations: &mut JoinSet<anyhow::Result<()>>) -> anyhow::Result<()> {
+    while let Some(result) = simulations.join_next().await {
+        result.context("simulation endpoint task failed")??;
+    }
+    Ok(())
+}
+
+async fn run_tcp_simulation(
+    config: EngineLaunchConfig,
+    endpoint: BoundEndpoint,
     listener: TcpListener,
     shutdown_rx: oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
-    match config.protocol.as_str() {
-        "http" => {
+    let node_id = env_string("SECLAB_NODE_ID", "local");
+    let callback_url = config.callback_url.clone();
+    let rule_name = Some(config.rule_name.clone());
+    let port = endpoint.container_port;
+    match config.protocol {
+        ProtocolId::Http => {
             simulation::start_http_simulation(
                 config.rule_id,
-                config.rule_name,
-                config.port,
-                config.callback_url,
-                config.node_id,
-                parse_rule_config(config.config_json)?,
+                rule_name,
+                port,
+                callback_url,
+                node_id,
+                parse_rule_config(config.behavior)?,
                 listener,
                 shutdown_rx,
             )
             .await
         }
-        "redis" => {
+        ProtocolId::Redis => {
             simulation::start_redis_simulation(
                 config.rule_id,
-                config.rule_name,
-                config.port,
-                config.callback_url,
-                config.node_id,
-                parse_rule_config(config.config_json)?,
+                rule_name,
+                port,
+                callback_url,
+                node_id,
+                parse_rule_config(config.behavior)?,
                 listener,
                 shutdown_rx,
             )
             .await
         }
-        "smtp" => {
+        ProtocolId::Smtp => {
             simulation::start_smtp_simulation(
                 config.rule_id,
-                config.rule_name,
-                config.port,
-                config.callback_url,
-                config.node_id,
-                parse_rule_config(config.config_json)?,
+                rule_name,
+                port,
+                callback_url,
+                node_id,
+                parse_rule_config(config.behavior)?,
                 listener,
                 shutdown_rx,
             )
             .await
         }
-        "pop3" => {
+        ProtocolId::Pop3 => {
             simulation::start_pop3_simulation(
                 config.rule_id,
-                config.rule_name,
-                config.port,
-                config.callback_url,
-                config.node_id,
-                parse_rule_config(config.config_json)?,
+                rule_name,
+                port,
+                callback_url,
+                node_id,
+                parse_rule_config(config.behavior)?,
                 listener,
                 shutdown_rx,
             )
             .await
         }
-        "imap" => {
+        ProtocolId::Imap => {
             simulation::start_imap_simulation(
                 config.rule_id,
-                config.rule_name,
-                config.port,
-                config.callback_url,
-                config.node_id,
-                parse_rule_config(config.config_json)?,
+                rule_name,
+                port,
+                callback_url,
+                node_id,
+                parse_rule_config(config.behavior)?,
                 listener,
                 shutdown_rx,
             )
             .await
         }
-        "ssh" => {
+        ProtocolId::Ssh => {
             simulation::start_ssh_simulation(
                 config.rule_id,
-                config.rule_name,
-                config.port,
-                config.callback_url,
-                config.node_id,
-                parse_rule_config(config.config_json)?,
+                rule_name,
+                port,
+                callback_url,
+                node_id,
+                parse_rule_config(config.behavior)?,
                 listener,
                 shutdown_rx,
             )
             .await
         }
-        "ftp" => {
+        ProtocolId::Ftp => {
             simulation::start_ftp_simulation(
                 config.rule_id,
-                config.rule_name,
-                config.port,
-                config.callback_url,
-                config.node_id,
-                parse_rule_config(config.config_json)?,
+                rule_name,
+                port,
+                callback_url,
+                node_id,
+                parse_rule_config(config.behavior)?,
                 listener,
                 shutdown_rx,
             )
             .await
         }
-        "rdp" => {
+        ProtocolId::Rdp => {
             simulation::start_rdp_simulation(
                 config.rule_id,
-                config.rule_name,
-                config.port,
-                config.callback_url,
-                config.node_id,
-                parse_rule_config(config.config_json)?,
+                rule_name,
+                port,
+                callback_url,
+                node_id,
+                parse_rule_config(config.behavior)?,
                 listener,
                 shutdown_rx,
             )
             .await
         }
-        other => anyhow::bail!("unsupported simulation protocol: {other}"),
+        ProtocolId::Telnet => {
+            simulation::start_telnet_simulation(
+                config.rule_id,
+                rule_name,
+                port,
+                callback_url,
+                node_id,
+                parse_rule_config(config.behavior)?,
+                listener,
+                shutdown_rx,
+            )
+            .await
+        }
+        ProtocolId::Mysql => {
+            simulation::start_mysql_simulation(
+                config.rule_id,
+                rule_name,
+                port,
+                callback_url,
+                node_id,
+                parse_rule_config(config.behavior)?,
+                listener,
+                shutdown_rx,
+            )
+            .await
+        }
+        ProtocolId::Postgresql => {
+            simulation::start_postgresql_simulation(
+                config.rule_id,
+                rule_name,
+                port,
+                callback_url,
+                node_id,
+                parse_rule_config(config.behavior)?,
+                listener,
+                shutdown_rx,
+            )
+            .await
+        }
+        ProtocolId::Smb => {
+            simulation::start_smb_simulation(
+                config.rule_id,
+                rule_name,
+                port,
+                callback_url,
+                node_id,
+                parse_rule_config(config.behavior)?,
+                listener,
+                shutdown_rx,
+            )
+            .await
+        }
+        ProtocolId::Ldap => {
+            simulation::start_ldap_simulation(
+                config.rule_id,
+                rule_name,
+                port,
+                callback_url,
+                node_id,
+                parse_rule_config(config.behavior)?,
+                listener,
+                shutdown_rx,
+            )
+            .await
+        }
+        ProtocolId::Dns => {
+            simulation::start_dns_tcp_simulation(
+                config.rule_id,
+                rule_name,
+                endpoint.endpoint_id,
+                port,
+                callback_url,
+                node_id,
+                parse_rule_config(config.behavior)?,
+                listener,
+                shutdown_rx,
+            )
+            .await
+        }
     }
+}
+
+async fn run_udp_simulation(
+    config: EngineLaunchConfig,
+    endpoint: BoundEndpoint,
+    socket: UdpSocket,
+    shutdown_rx: oneshot::Receiver<()>,
+) -> anyhow::Result<()> {
+    if config.protocol != ProtocolId::Dns {
+        anyhow::bail!(
+            "protocol {} does not support UDP endpoint {}",
+            config.protocol.as_str(),
+            endpoint.endpoint_id
+        );
+    }
+    simulation::start_dns_udp_simulation(
+        config.rule_id,
+        Some(config.rule_name),
+        endpoint.endpoint_id,
+        endpoint.container_port,
+        config.callback_url,
+        env_string("SECLAB_NODE_ID", "local"),
+        parse_rule_config(config.behavior)?,
+        socket,
+        shutdown_rx,
+    )
+    .await
+}
+
+fn launch_config_from_env() -> anyhow::Result<EngineLaunchConfig> {
+    let value = std::env::var("SECLAB_WORKLOAD_CONFIG_JSON")
+        .context("SECLAB_WORKLOAD_CONFIG_JSON is required")?;
+    serde_json::from_str(&value).context("SECLAB_WORKLOAD_CONFIG_JSON must be a v1 launch config")
 }
 
 async fn shutdown_signal() {
@@ -193,40 +377,6 @@ async fn shutdown_signal() {
     }
 }
 
-impl EngineConfig {
-    fn from_env() -> anyhow::Result<Self> {
-        let protocol = env_string("SECLAB_SIM_PROTOCOL", "http");
-        let rule_id = env_string("SECLAB_SIM_RULE_ID", "placeholder");
-        let instance_id = env_string("SECLAB_SIM_INSTANCE_ID", "engine-placeholder");
-        let callback_url = env_string("SECLAB_SIM_CALLBACK_URL", DEFAULT_EVENT_CALLBACK_URL);
-        let node_id = env_string("SECLAB_NODE_ID", "local");
-        let port = env_string("SECLAB_SIM_PORT", "8081")
-            .parse::<u16>()
-            .context("SECLAB_SIM_PORT must be a valid TCP port")?;
-        let config_json = std::env::var("SECLAB_SIM_CONFIG_JSON")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| serde_json::from_str(&value))
-            .transpose()
-            .context("SECLAB_SIM_CONFIG_JSON must be valid JSON")?
-            .unwrap_or_else(|| serde_json::json!({}));
-        let rule_name = std::env::var("SECLAB_SIM_RULE_NAME")
-            .ok()
-            .filter(|value| !value.trim().is_empty());
-
-        Ok(Self {
-            protocol,
-            rule_id,
-            rule_name,
-            instance_id,
-            callback_url,
-            node_id,
-            port,
-            config_json,
-        })
-    }
-}
-
 fn env_string(name: &str, default_value: &str) -> String {
     std::env::var(name)
         .ok()
@@ -238,10 +388,5 @@ fn parse_rule_config<T>(value: serde_json::Value) -> anyhow::Result<T>
 where
     T: serde::de::DeserializeOwned,
 {
-    let config = value
-        .get("behavior")
-        .filter(|item| item.is_object())
-        .cloned()
-        .unwrap_or(value);
-    serde_json::from_value(config).context("failed to parse simulation rule config")
+    serde_json::from_value(value).context("failed to parse simulation rule behavior")
 }

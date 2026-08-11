@@ -25,9 +25,17 @@ pub struct StartWorkloadRequest {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkloadPort {
+    pub endpoint_id: String,
     pub host_port: u16,
     pub container_port: u16,
-    pub protocol: String,
+    pub protocol: WorkloadTransport,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkloadTransport {
+    Tcp,
+    Udp,
 }
 
 #[derive(Debug, Serialize)]
@@ -82,16 +90,20 @@ impl fmt::Display for AgentApiError {
 
 impl std::error::Error for AgentApiError {}
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StartPcapRequest {
-    pub host_port: u16,
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartPcapResponse {
     pub capture_id: String,
+    #[serde(default)]
+    pub endpoints: Vec<CaptureEndpoint>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureEndpoint {
+    pub endpoint_id: String,
+    pub host_port: u16,
+    pub protocol: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -125,6 +137,25 @@ impl AgentClient {
             .context("invalid Agent suite workload start response")
     }
 
+    /// 读取 Agent 注入的 v1 runtime 描述中的平台版本，用于规则包最低版本校验。
+    pub async fn platform_version(&self) -> anyhow::Result<semver::Version> {
+        let content = tokio::fs::read_to_string(&self.config.agent_runtime_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to read Agent runtime descriptor {}",
+                    self.config.agent_runtime_path.display()
+                )
+            })?;
+        let value = serde_json::from_str::<serde_json::Value>(&content)
+            .context("invalid Agent runtime descriptor JSON")?;
+        let version = value
+            .get("platformVersion")
+            .and_then(serde_json::Value::as_str)
+            .context("Agent runtime descriptor is missing platformVersion")?;
+        semver::Version::parse(version).context("Agent platformVersion is invalid")
+    }
+
     pub async fn stop_workload(&self, workload_id: &str) -> anyhow::Result<()> {
         let runtime = self.runtime_client("workloads.manage").await?;
         runtime
@@ -138,18 +169,13 @@ impl AgentClient {
         Ok(())
     }
 
-    pub async fn start_pcap(
-        &self,
-        workload_id: &str,
-        host_port: u16,
-    ) -> anyhow::Result<StartPcapResponse> {
+    pub async fn start_pcap(&self, workload_id: &str) -> anyhow::Result<StartPcapResponse> {
         let runtime = self.runtime_client("captures.manage").await?;
-        let payload = StartPcapRequest { host_port };
         let response = runtime
-            .request(
+            .request::<serde_json::Value>(
                 Method::POST,
                 &format!("/api/v1/agent/suite-runtime/workloads/{workload_id}/captures"),
-                Some(&payload),
+                None,
             )
             .await
             .map_err(runtime_error)?;
@@ -236,6 +262,7 @@ mod tests {
         let unix = serde_json::from_str::<RuntimeDescriptor>(
             r#"{
                 "schemaVersion": 1,
+                "platformVersion": "0.1.0-alpha.3",
                 "suiteId": "suite.example",
                 "instanceId": "instance-1",
                 "endpoint": {
@@ -253,6 +280,7 @@ mod tests {
         let https = serde_json::from_str::<RuntimeDescriptor>(
             r#"{
                 "schemaVersion": 1,
+                "platformVersion": "0.1.0-alpha.3",
                 "suiteId": "suite.example",
                 "instanceId": "instance-1",
                 "endpoint": {
