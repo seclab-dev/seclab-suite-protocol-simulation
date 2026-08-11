@@ -78,7 +78,7 @@ impl fmt::Display for AgentApiError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "Agent suite workload start failed: {}: {}",
+            "Agent suite runtime request failed: {}: {}",
             self.status, self.message
         )?;
         if let Some(detail) = &self.detail {

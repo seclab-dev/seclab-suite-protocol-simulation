@@ -23,6 +23,7 @@ use seclab_suite_runtime::{
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::{DefaultMakeSpan, TraceLayer};
@@ -30,6 +31,8 @@ use tracing::Level;
 use uuid::Uuid;
 
 type ApiResult<T> = Result<T, ApiError>;
+
+const PCAP_MAX_DURATION_SECS: i64 = 300;
 
 #[derive(Debug)]
 struct ApiError {
@@ -564,6 +567,7 @@ async fn undeploy_instance(
 }
 
 async fn reconcile_instances_with_agent(state: &AppState) -> ApiResult<Vec<Instance>> {
+    finalize_expired_pcap_captures(state).await;
     let instances = db::list_instances(&state.db).await?;
     let workloads = match state.agent.list_workloads().await {
         Ok(workloads) => workloads,
@@ -656,6 +660,7 @@ async fn start_pcap(
     )
     .await?
     .unwrap_or(instance);
+    schedule_pcap_auto_stop(state.clone(), id.clone(), capture.capture_id, started_at);
     emit_operation_event(
         &state,
         operation_event(
@@ -690,16 +695,8 @@ async fn stop_pcap(
             data: instance,
         }));
     }
-    let workload_id = instance
-        .workload_id
-        .as_deref()
-        .ok_or_else(|| ApiError::bad_request("instance workload is missing"))?;
-    let capture_id = instance
-        .pcap_capture_id
-        .as_deref()
-        .ok_or_else(|| ApiError::bad_request("pcap capture id is missing"))?;
-    let pcap_bytes = match state.agent.stop_pcap(workload_id, capture_id).await {
-        Ok(bytes) => bytes,
+    let updated = match finalize_pcap_capture(&state, &id, None).await {
+        Ok((updated, _)) => updated,
         Err(error) => {
             emit_operation_event(
                 &state,
@@ -720,40 +717,6 @@ async fn stop_pcap(
             return Err(error.into());
         }
     };
-    if pcap_bytes.len() <= 24 {
-        let updated = db::update_pcap_state(&state.db, &id, "idle", None, None, None)
-            .await?
-            .unwrap_or(instance);
-        emit_operation_event(
-            &state,
-            operation_event(
-                "capture_stopped",
-                "停止抓包",
-                "Stop capture",
-                "simulation_instance",
-                &id,
-                (OperationOutcome::Success, OperationImpact::Info),
-                operation_context.as_deref(),
-            ),
-        )
-        .await;
-        return Ok(Json(ApiEnvelope {
-            success: true,
-            data: updated,
-        }));
-    }
-    let pcap_dir = state.config.data_dir.join("pcap");
-    tokio::fs::create_dir_all(&pcap_dir)
-        .await
-        .map_err(anyhow::Error::from)?;
-    let file_name = format!("pcap_{id}.pcap");
-    let file_path = pcap_dir.join(&file_name);
-    tokio::fs::write(&file_path, pcap_bytes)
-        .await
-        .map_err(anyhow::Error::from)?;
-    let updated = db::update_pcap_state(&state.db, &id, "ready", None, None, Some(&file_name))
-        .await?
-        .unwrap_or(instance);
     emit_operation_event(
         &state,
         operation_event(
@@ -771,6 +734,134 @@ async fn stop_pcap(
         success: true,
         data: updated,
     }))
+}
+
+fn schedule_pcap_auto_stop(
+    state: Arc<AppState>,
+    instance_id: String,
+    capture_id: String,
+    started_at: i64,
+) {
+    tokio::spawn(async move {
+        let deadline = started_at.saturating_add(PCAP_MAX_DURATION_SECS);
+        let delay = deadline.saturating_sub(chrono::Utc::now().timestamp()) as u64;
+        tokio::time::sleep(Duration::from_secs(delay)).await;
+        auto_stop_pcap(&state, &instance_id, &capture_id).await;
+    });
+}
+
+async fn finalize_expired_pcap_captures(state: &AppState) {
+    let Ok(instances) = db::list_instances(&state.db).await else {
+        return;
+    };
+    let deadline = chrono::Utc::now().timestamp() - PCAP_MAX_DURATION_SECS;
+    for instance in instances {
+        if instance.pcap_status == "capturing"
+            && instance
+                .pcap_start_time
+                .is_some_and(|started| started <= deadline)
+            && let Some(capture_id) = instance.pcap_capture_id.as_deref()
+        {
+            auto_stop_pcap(state, &instance.id, capture_id).await;
+        }
+    }
+}
+
+async fn auto_stop_pcap(state: &AppState, instance_id: &str, capture_id: &str) {
+    match finalize_pcap_capture(state, instance_id, Some(capture_id)).await {
+        Ok((_, true)) => {
+            emit_operation_event(
+                state,
+                operation_event(
+                    "capture_stopped",
+                    "停止抓包",
+                    "Stop capture",
+                    "simulation_instance",
+                    instance_id,
+                    (OperationOutcome::Success, OperationImpact::Info),
+                    None,
+                ),
+            )
+            .await;
+        }
+        Ok((_, false)) => {}
+        Err(error) => {
+            tracing::error!(
+                instance_id,
+                capture_id,
+                %error,
+                "failed to stop pcap capture at duration limit"
+            );
+            emit_operation_event(
+                state,
+                operation_event_builder(
+                    "capture_stopped",
+                    "停止抓包",
+                    "Stop capture",
+                    "simulation_instance",
+                    instance_id,
+                    (OperationOutcome::Failure, OperationImpact::Error),
+                    None,
+                )
+                .error("CAPTURE_AUTO_STOP_FAILED", "Capture auto stop failed")
+                .build()
+                .expect("static operation event must be valid"),
+            )
+            .await;
+        }
+    }
+}
+
+async fn finalize_pcap_capture(
+    state: &AppState,
+    instance_id: &str,
+    expected_capture_id: Option<&str>,
+) -> anyhow::Result<(Instance, bool)> {
+    let _guard = state.pcap_finalization_lock.lock().await;
+    let instance = db::get_instance(&state.db, instance_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("instance not found"))?;
+    if instance.pcap_status != "capturing"
+        || expected_capture_id
+            .is_some_and(|expected| instance.pcap_capture_id.as_deref() != Some(expected))
+    {
+        return Ok((instance, false));
+    }
+    let workload_id = instance
+        .workload_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("instance workload is missing"))?;
+    let capture_id = instance
+        .pcap_capture_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("pcap capture id is missing"))?;
+    let pcap_bytes = state.agent.stop_pcap(workload_id, capture_id).await?;
+    if pcap_bytes.len() <= 24 {
+        return Ok((
+            db::update_pcap_state(&state.db, instance_id, "idle", None, None, None)
+                .await?
+                .unwrap_or(instance),
+            true,
+        ));
+    }
+
+    let pcap_dir = state.config.data_dir.join("pcap");
+    tokio::fs::create_dir_all(&pcap_dir).await?;
+    let file_name = format!("pcap_{instance_id}.pcap");
+    tokio::fs::write(pcap_dir.join(&file_name), pcap_bytes).await?;
+    Ok((
+        db::update_pcap_state(
+            &state.db,
+            instance_id,
+            "ready",
+            None,
+            None,
+            Some(&file_name),
+        )
+        .await?
+        .unwrap_or(instance),
+        true,
+    ))
 }
 
 async fn delete_pcap(

@@ -35,6 +35,7 @@ pub struct AppState {
     pub db: SqlitePool,
     pub audit_logs: db::AuditLogWriter,
     pub agent: agent::AgentClient,
+    pub pcap_finalization_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Config {
@@ -97,6 +98,7 @@ impl AppState {
             db,
             audit_logs,
             agent,
+            pcap_finalization_lock: Arc::new(tokio::sync::Mutex::new(())),
         }))
     }
 }

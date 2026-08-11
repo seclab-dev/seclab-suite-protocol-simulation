@@ -580,6 +580,7 @@ watch(activeTab, (tab) => {
 /** 秒级递增的系统当前时间戳，用于本地实时倒计时/正计时运算 */
 const nowSec = ref(Math.floor(Date.now() / 1000));
 let timerId: ReturnType<typeof setInterval> | null = null;
+let refreshingExpiredCaptures = false;
 const pcapStartClientTimes = ref<Record<string, number>>({});
 
 const getPcapStartTime = (row: SimInstance) =>
@@ -804,6 +805,24 @@ onMounted(() => {
   // 维持秒级累加计时器，服务于流量捕获倒计时的状态刷新
   timerId = setInterval(() => {
     nowSec.value = Math.floor(Date.now() / 1000);
+    const hasExpiredCapture = instances.value.some((instance) => {
+      const startedAt = getPcapStartTime(instance);
+      return (
+        instance.pcapStatus === "capturing" &&
+        !!startedAt &&
+        nowSec.value - startedAt >= 300
+      );
+    });
+    if (
+      activeTab.value === "deployments" &&
+      hasExpiredCapture &&
+      !refreshingExpiredCaptures
+    ) {
+      refreshingExpiredCaptures = true;
+      void loadNodeInstances(true).finally(() => {
+        refreshingExpiredCaptures = false;
+      });
+    }
   }, 1000);
 });
 
