@@ -337,6 +337,27 @@ const deployForm = ref({
 /** 是否正在提交实例部署请求，用于阻止重复部署。 */
 const isDeploying = ref(false);
 
+/** 正在执行下线操作的实例 ID，避免全局遮罩影响表格布局。 */
+const undeployingInstanceIds = ref<string[]>([]);
+
+/** 是否正在批量下线实例。 */
+const isBatchUndeploying = ref(false);
+
+const isUndeploying = (instanceId: string) =>
+  undeployingInstanceIds.value.includes(instanceId);
+
+const setInstancesUndeploying = (
+  instanceIds: string[],
+  undeploying: boolean,
+) => {
+  const next = new Set(undeployingInstanceIds.value);
+  for (const instanceId of instanceIds) {
+    if (undeploying) next.add(instanceId);
+    else next.delete(instanceId);
+  }
+  undeployingInstanceIds.value = [...next];
+};
+
 /** 部署确认按钮可用状态。套件固定部署到本地节点。 */
 const canConfirmDeploy = computed(
   () => deployForm.value.nodeId === "local" && !isDeploying.value,
@@ -1529,6 +1550,8 @@ const executeDeploy = async () => {
  * @param id 仿真运行实例 ID
  */
 const handleUndeploy = async (id: string) => {
+  if (isUndeploying(id) || isBatchUndeploying.value) return;
+
   const instance = instances.value.find((inst) => inst.instanceId === id);
   const rule = instance
     ? rules.value.find((p) => p.id === instance.ruleId)
@@ -1542,8 +1565,9 @@ const handleUndeploy = async (id: string) => {
     t("confirmation.cancel"),
   );
   if (!confirmed) return;
+  if (isUndeploying(id) || isBatchUndeploying.value) return;
 
-  isLoading.value = true;
+  setInstancesUndeploying([id], true);
   try {
     const res = await simulationApi.undeploySimulation(id);
     if (res.success) {
@@ -1573,7 +1597,7 @@ const handleUndeploy = async (id: string) => {
       }),
     );
   } finally {
-    isLoading.value = false;
+    setInstancesUndeploying([id], false);
   }
 };
 
@@ -1591,6 +1615,7 @@ interface InstanceMenuAction {
   label: string;
   icon: string;
   className?: string;
+  disabled?: boolean;
   handler: () => void;
 }
 
@@ -1604,6 +1629,7 @@ const instanceActions = (instance: SimInstance): InstanceMenuAction[] => [
     label: t("app.simulation.deployments.btnUndeploy"),
     icon: "trash",
     className: "app-btn-delete",
+    disabled: isUndeploying(instance.instanceId) || isBatchUndeploying.value,
     handler: () => void handleUndeploy(instance.instanceId),
   },
 ];
@@ -1666,7 +1692,13 @@ const formatNamesList = (names: string[]) => {
 };
 
 const handleBatchUndeploy = async () => {
-  if (selectedInstanceIds.value.length === 0) return;
+  if (
+    selectedInstanceIds.value.length === 0 ||
+    isBatchUndeploying.value ||
+    undeployingInstanceIds.value.length > 0
+  ) {
+    return;
+  }
 
   const confirmed = await modalStore.showConfirmation(
     t("app.simulation.deployments.batchUndeployConfirm", {
@@ -1677,14 +1709,19 @@ const handleBatchUndeploy = async () => {
     t("confirmation.cancel"),
   );
   if (!confirmed) return;
+  if (isBatchUndeploying.value || undeployingInstanceIds.value.length > 0) {
+    return;
+  }
 
-  isLoading.value = true;
+  const targetIds = [...selectedInstanceIds.value];
+  isBatchUndeploying.value = true;
+  setInstancesUndeploying(targetIds, true);
   const successNames: string[] = [];
   const successIds: string[] = [];
   const failNames: string[] = [];
 
   try {
-    const promises = selectedInstanceIds.value.map(async (id) => {
+    const promises = targetIds.map(async (id) => {
       const ruleName = getRuleNameForInstance(id);
       try {
         const res = await simulationApi.undeploySimulation(id);
@@ -1734,7 +1771,8 @@ const handleBatchUndeploy = async () => {
       t("app.simulation.deployments.messages.batchUndeployError"),
     );
   } finally {
-    isLoading.value = false;
+    setInstancesUndeploying(targetIds, false);
+    isBatchUndeploying.value = false;
   }
 };
 
@@ -1875,6 +1913,10 @@ const handleDownloadPcap = async (row: SimInstance) => {
               v-if="selectedInstanceIds.length > 0"
               type="danger"
               data-ui="sim-batch-undeploy-btn"
+              :loading="isBatchUndeploying"
+              :disabled="
+                isBatchUndeploying || undeployingInstanceIds.length > 0
+              "
               @click="handleBatchUndeploy"
             >
               {{ t("app.simulation.deployments.btnBatchUndeploy") }} ({{
@@ -1901,6 +1943,7 @@ const handleDownloadPcap = async (row: SimInstance) => {
               <template #selection="{ row }">
                 <SecLabCheckbox
                   :model-value="selectedInstanceIds.includes(row.instanceId)"
+                  :disabled="isUndeploying(row.instanceId)"
                   @change="(val) => handleSelectChange(row.instanceId, val)"
                 />
               </template>
@@ -2034,6 +2077,7 @@ const handleDownloadPcap = async (row: SimInstance) => {
                 <SecLabActionMenu
                   :label="t('common.actions')"
                   :actions="instanceActions(toInstance(row))"
+                  :disabled="isUndeploying(toInstance(row).instanceId)"
                 />
               </template>
               <template #empty>
