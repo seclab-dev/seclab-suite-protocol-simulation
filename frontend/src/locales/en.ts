@@ -293,7 +293,6 @@ const en = {
           nodeName: "Node Name",
           clientIp: "Attacker IP",
           clientPort: "Source Port",
-          endpoint: "Endpoint",
           eventType: "Event Type",
           summary: "Semantic Overview",
         },

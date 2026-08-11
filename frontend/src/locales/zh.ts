@@ -278,7 +278,6 @@ const zh: typeof en = {
           nodeName: "节点名称",
           clientIp: "攻击源 IP",
           clientPort: "源端口",
-          endpoint: "端点",
           eventType: "事件类型",
           summary: "语义审计概要",
         },

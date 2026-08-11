@@ -56,12 +56,6 @@ const columns = computed<SecLabTableColumn[]>(() => [
     slot: "time",
   },
   {
-    prop: "endpointId",
-    label: t("app.simulation.logs.columns.endpoint"),
-    width: 100,
-    align: "center",
-  },
-  {
     prop: "clientIp",
     label: t("app.simulation.logs.columns.clientIp"),
     width: 140,
