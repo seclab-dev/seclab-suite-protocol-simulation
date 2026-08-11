@@ -495,6 +495,16 @@ pub async fn list_instances(db: &SqlitePool) -> anyhow::Result<Vec<Instance>> {
     Ok(instances)
 }
 
+pub async fn list_pcap_file_paths(db: &SqlitePool) -> anyhow::Result<HashSet<String>> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT pcap_file_path FROM instances WHERE pcap_file_path IS NOT NULL",
+    )
+    .fetch_all(db)
+    .await
+    .context("failed to list referenced pcap files")
+    .map(|files| files.into_iter().collect())
+}
+
 pub async fn insert_instance_if_port_available(
     db: &SqlitePool,
     instance: &Instance,

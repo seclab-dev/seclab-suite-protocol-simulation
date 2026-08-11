@@ -1,6 +1,7 @@
 mod agent;
 mod db;
 mod models;
+mod pcap;
 mod routes;
 mod rule_package;
 
@@ -91,6 +92,21 @@ impl AppState {
             .await
             .with_context(|| format!("failed to open sqlite database {}", db_path.display()))?;
         db::init(&db).await?;
+        let referenced_pcap_files = db::list_pcap_file_paths(&db).await?;
+        match pcap::cleanup_orphaned_capture_files(&config.data_dir, &referenced_pcap_files).await {
+            Ok(report) => {
+                if report.removed > 0 {
+                    tracing::info!(
+                        removed_count = report.removed,
+                        "removed orphaned protocol simulation pcap files"
+                    );
+                }
+                for (file_name, error) in report.failures {
+                    tracing::warn!(file_name, error, "failed to remove orphaned pcap file");
+                }
+            }
+            Err(error) => tracing::warn!(%error, "failed to scan orphaned pcap files"),
+        }
         let audit_logs = db::AuditLogWriter::start(db.clone(), config.audit_max_per_instance);
         let agent = agent::AgentClient::new(config.clone());
         Ok(Arc::new(Self {
@@ -178,6 +194,30 @@ mod tests {
             .unwrap();
 
         assert_eq!(journal_mode, "wal");
+    }
+
+    #[tokio::test]
+    async fn initialize_removes_orphaned_managed_pcap_files() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let pcap_dir = data_dir.path().join("pcap");
+        tokio::fs::create_dir_all(&pcap_dir).await.unwrap();
+        let orphan = pcap_dir.join("pcap_instance-orphan.pcap");
+        tokio::fs::write(&orphan, b"orphan").await.unwrap();
+        let config = Config {
+            http_port: 8080,
+            data_dir: data_dir.path().to_path_buf(),
+            frontend_dir: data_dir.path().to_path_buf(),
+            agent_runtime_path: data_dir.path().join("runtime.json"),
+            suite_id: "seclab.protocol-simulation".to_string(),
+            suite_instance_id: "instance-1".to_string(),
+            engine_image: "protocol-simulation-engine:test".to_string(),
+            event_callback_url: DEFAULT_EVENT_CALLBACK_URL.to_string(),
+            audit_max_per_instance: DEFAULT_AUDIT_MAX_PER_INSTANCE,
+        };
+
+        AppState::initialize(config).await.unwrap();
+
+        assert!(!orphan.exists());
     }
 
     #[test]

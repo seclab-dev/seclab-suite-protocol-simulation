@@ -7,6 +7,7 @@ use super::models::{
     ApiEnvelope, AuditLogPage, CreateRuleRequest, DeployInstanceRequest, ErrorEnvelope,
     EventRequest, Instance,
 };
+use super::pcap;
 use super::rule_package;
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -509,6 +510,7 @@ async fn undeploy_instance(
     Path(id): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     let operation_context = operation_context(&headers);
+    let _guard = state.pcap_finalization_lock.lock().await;
     let Some(instance) = db::get_instance(&state.db, &id).await? else {
         return Err(ApiError::not_found("instance not found"));
     };
@@ -536,6 +538,42 @@ async fn undeploy_instance(
                 operation_context.as_deref(),
             )
             .error("INSTANCE_UNDEPLOY_FAILED", "Simulation undeployment failed")
+            .build()
+            .expect("static operation event must be valid"),
+        )
+        .await;
+        return Ok(Json(ApiEnvelope {
+            success: true,
+            data: updated.unwrap_or(instance),
+        }));
+    }
+    if let Err(err) =
+        pcap::remove_capture_file(&state.config.data_dir, instance.pcap_file_path.as_deref()).await
+    {
+        let error_message = format!("{err:#}");
+        let updated = db::update_instance_status(
+            &state.db,
+            &id,
+            "error",
+            instance.workload_id.as_deref(),
+            Some(&error_message),
+        )
+        .await?;
+        emit_operation_event(
+            &state,
+            operation_event_builder(
+                "instance_undeployed",
+                "撤销仿真实例",
+                "Undeploy simulation instance",
+                "simulation_instance",
+                &id,
+                (OperationOutcome::Failure, OperationImpact::Error),
+                operation_context.as_deref(),
+            )
+            .error(
+                "INSTANCE_PCAP_CLEANUP_FAILED",
+                "Simulation PCAP cleanup failed",
+            )
             .build()
             .expect("static operation event must be valid"),
         )
@@ -611,6 +649,7 @@ async fn start_pcap(
     Path(id): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     let operation_context = operation_context(&headers);
+    let _guard = state.pcap_finalization_lock.lock().await;
     let Some(instance) = db::get_instance(&state.db, &id).await? else {
         return Err(ApiError::not_found("instance not found"));
     };
@@ -696,7 +735,8 @@ async fn stop_pcap(
         }));
     }
     let updated = match finalize_pcap_capture(&state, &id, None).await {
-        Ok((updated, _)) => updated,
+        Ok(Some((updated, _))) => updated,
+        Ok(None) => return Err(ApiError::not_found("instance not found")),
         Err(error) => {
             emit_operation_event(
                 &state,
@@ -769,7 +809,7 @@ async fn finalize_expired_pcap_captures(state: &AppState) {
 
 async fn auto_stop_pcap(state: &AppState, instance_id: &str, capture_id: &str) {
     match finalize_pcap_capture(state, instance_id, Some(capture_id)).await {
-        Ok((_, true)) => {
+        Ok(Some((_, true))) => {
             emit_operation_event(
                 state,
                 operation_event(
@@ -784,7 +824,7 @@ async fn auto_stop_pcap(state: &AppState, instance_id: &str, capture_id: &str) {
             )
             .await;
         }
-        Ok((_, false)) => {}
+        Ok(Some((_, false)) | None) => {}
         Err(error) => {
             tracing::error!(
                 instance_id,
@@ -816,16 +856,16 @@ async fn finalize_pcap_capture(
     state: &AppState,
     instance_id: &str,
     expected_capture_id: Option<&str>,
-) -> anyhow::Result<(Instance, bool)> {
+) -> anyhow::Result<Option<(Instance, bool)>> {
     let _guard = state.pcap_finalization_lock.lock().await;
-    let instance = db::get_instance(&state.db, instance_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("instance not found"))?;
+    let Some(instance) = db::get_instance(&state.db, instance_id).await? else {
+        return Ok(None);
+    };
     if instance.pcap_status != "capturing"
         || expected_capture_id
             .is_some_and(|expected| instance.pcap_capture_id.as_deref() != Some(expected))
     {
-        return Ok((instance, false));
+        return Ok(Some((instance, false)));
     }
     let workload_id = instance
         .workload_id
@@ -837,19 +877,19 @@ async fn finalize_pcap_capture(
         .ok_or_else(|| anyhow::anyhow!("pcap capture id is missing"))?;
     let pcap_bytes = state.agent.stop_pcap(workload_id, capture_id).await?;
     if pcap_bytes.len() <= 24 {
-        return Ok((
+        return Ok(Some((
             db::update_pcap_state(&state.db, instance_id, "idle", None, None, None)
                 .await?
                 .unwrap_or(instance),
             true,
-        ));
+        )));
     }
 
     let pcap_dir = state.config.data_dir.join("pcap");
     tokio::fs::create_dir_all(&pcap_dir).await?;
-    let file_name = format!("pcap_{instance_id}.pcap");
+    let file_name = pcap::capture_file_name(instance_id);
     tokio::fs::write(pcap_dir.join(&file_name), pcap_bytes).await?;
-    Ok((
+    Ok(Some((
         db::update_pcap_state(
             &state.db,
             instance_id,
@@ -861,7 +901,7 @@ async fn finalize_pcap_capture(
         .await?
         .unwrap_or(instance),
         true,
-    ))
+    )))
 }
 
 async fn delete_pcap(
@@ -870,19 +910,55 @@ async fn delete_pcap(
     Path(id): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     let operation_context = operation_context(&headers);
+    let _guard = state.pcap_finalization_lock.lock().await;
     let Some(instance) = db::get_instance(&state.db, &id).await? else {
         return Err(ApiError::not_found("instance not found"));
     };
-    if let Some(file) = instance.pcap_file_path.as_deref() {
-        let _ = tokio::fs::remove_file(state.config.data_dir.join("pcap").join(file)).await;
-    }
     if instance.pcap_status == "capturing"
         && let (Some(workload_id), Some(capture_id)) = (
             instance.workload_id.as_deref(),
             instance.pcap_capture_id.as_deref(),
         )
+        && let Err(error) = state.agent.stop_pcap(workload_id, capture_id).await
     {
-        let _ = state.agent.stop_pcap(workload_id, capture_id).await;
+        emit_operation_event(
+            &state,
+            operation_event_builder(
+                "capture_deleted",
+                "删除抓包",
+                "Delete capture",
+                "simulation_instance",
+                &id,
+                (OperationOutcome::Failure, OperationImpact::Error),
+                operation_context.as_deref(),
+            )
+            .error("CAPTURE_DELETE_FAILED", "Capture deletion failed")
+            .build()
+            .expect("static operation event must be valid"),
+        )
+        .await;
+        return Err(error.into());
+    }
+    if let Err(error) =
+        pcap::remove_capture_file(&state.config.data_dir, instance.pcap_file_path.as_deref()).await
+    {
+        emit_operation_event(
+            &state,
+            operation_event_builder(
+                "capture_deleted",
+                "删除抓包",
+                "Delete capture",
+                "simulation_instance",
+                &id,
+                (OperationOutcome::Failure, OperationImpact::Error),
+                operation_context.as_deref(),
+            )
+            .error("CAPTURE_FILE_DELETE_FAILED", "Capture file deletion failed")
+            .build()
+            .expect("static operation event must be valid"),
+        )
+        .await;
+        return Err(error.into());
     }
     let updated = db::update_pcap_state(&state.db, &id, "idle", None, None, None)
         .await?
@@ -1313,6 +1389,30 @@ mod tests {
                 "message": "database unavailable"
             })
         );
+    }
+
+    #[tokio::test]
+    async fn expired_capture_task_ignores_an_already_deleted_instance() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let state = AppState::initialize(crate::Config {
+            http_port: 8080,
+            data_dir: data_dir.path().to_path_buf(),
+            frontend_dir: data_dir.path().to_path_buf(),
+            agent_runtime_path: data_dir.path().join("runtime.json"),
+            suite_id: "seclab.protocol-simulation".to_string(),
+            suite_instance_id: "suite-instance-1".to_string(),
+            engine_image: "protocol-simulation-engine:test".to_string(),
+            event_callback_url: protocol_simulation_common::DEFAULT_EVENT_CALLBACK_URL.to_string(),
+            audit_max_per_instance: 10_000,
+        })
+        .await
+        .unwrap();
+
+        let result = finalize_pcap_capture(&state, "missing-instance", Some("capture-1"))
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
     }
 
     #[test]
