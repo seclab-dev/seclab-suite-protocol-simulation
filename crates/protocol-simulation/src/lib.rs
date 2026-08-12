@@ -11,9 +11,11 @@ use anyhow::Context;
 use protocol_simulation_common::DEFAULT_EVENT_CALLBACK_URL;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 const DEFAULT_AUDIT_MAX_PER_INSTANCE: usize = 10_000;
 
@@ -36,7 +38,30 @@ pub struct AppState {
     pub db: SqlitePool,
     pub audit_logs: db::AuditLogWriter,
     pub agent: agent::AgentClient,
-    pub pcap_finalization_lock: Arc<tokio::sync::Mutex<()>>,
+    pub instance_lifecycle_locks: InstanceLifecycleLocks,
+}
+
+#[derive(Clone, Default)]
+pub struct InstanceLifecycleLocks {
+    locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
+}
+
+impl InstanceLifecycleLocks {
+    pub async fn lock(&self, instance_id: &str) -> OwnedMutexGuard<()> {
+        let instance_lock = {
+            let mut locks = self.locks.lock().await;
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            match locks.get(instance_id).and_then(Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(Mutex::new(()));
+                    locks.insert(instance_id.to_string(), Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        instance_lock.lock_owned().await
+    }
 }
 
 impl Config {
@@ -114,7 +139,7 @@ impl AppState {
             db,
             audit_logs,
             agent,
-            pcap_finalization_lock: Arc::new(tokio::sync::Mutex::new(())),
+            instance_lifecycle_locks: InstanceLifecycleLocks::default(),
         }))
     }
 }
@@ -218,6 +243,42 @@ mod tests {
         AppState::initialize(config).await.unwrap();
 
         assert!(!orphan.exists());
+    }
+
+    #[tokio::test]
+    async fn instance_lifecycle_locks_serialize_the_same_instance() {
+        let locks = InstanceLifecycleLocks::default();
+        let first = locks.lock("instance-1").await;
+
+        let blocked =
+            tokio::time::timeout(Duration::from_millis(20), locks.lock("instance-1")).await;
+        assert!(blocked.is_err());
+
+        drop(first);
+        tokio::time::timeout(Duration::from_millis(100), locks.lock("instance-1"))
+            .await
+            .expect("same instance lock should be released");
+    }
+
+    #[tokio::test]
+    async fn instance_lifecycle_locks_allow_different_instances() {
+        let locks = InstanceLifecycleLocks::default();
+        let _first = locks.lock("instance-1").await;
+
+        tokio::time::timeout(Duration::from_millis(100), locks.lock("instance-2"))
+            .await
+            .expect("different instance locks should not block each other");
+    }
+
+    #[tokio::test]
+    async fn instance_lifecycle_locks_prune_unused_entries() {
+        let locks = InstanceLifecycleLocks::default();
+        drop(locks.lock("instance-1").await);
+        let _second = locks.lock("instance-2").await;
+
+        let entries = locks.locks.lock().await;
+        assert!(!entries.contains_key("instance-1"));
+        assert!(entries.contains_key("instance-2"));
     }
 
     #[test]

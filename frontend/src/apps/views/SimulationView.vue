@@ -343,6 +343,29 @@ const undeployingInstanceIds = ref<string[]>([]);
 /** 是否正在批量下线实例。 */
 const isBatchUndeploying = ref(false);
 
+/** 限制同时销毁的工作负载数量，避免批量请求压垮 Agent。 */
+const BATCH_UNDEPLOY_CONCURRENCY = 4;
+
+const mapWithConcurrency = async <T, R>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T) => Promise<R>,
+): Promise<R[]> => {
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+  const workerCount = Math.min(concurrency, items.length);
+
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (cursor < items.length) {
+      const index = cursor;
+      cursor += 1;
+      results[index] = await mapper(items[index]);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+};
+
 const isUndeploying = (instanceId: string) =>
   undeployingInstanceIds.value.includes(instanceId);
 
@@ -1697,16 +1720,12 @@ const formatNamesList = (names: string[]) => {
   } else {
     const subset = names.slice(0, 3);
     const extraCount = names.length - 3;
-    if (locale.value === "en") {
-      return (
-        subset.map((n) => `"${n}"`).join(", ") +
-        ` and other ${extraCount} instances`
-      );
-    } else {
-      return (
-        subset.map((n) => `“${n}”`).join("、") + `等 ${extraCount} 个服务实例`
-      );
-    }
+    return t("app.simulation.deployments.messages.truncatedInstanceNames", {
+      names: subset
+        .map((name) => `${quoteChar}${name}${endQuoteChar}`)
+        .join(comma),
+      count: extraCount,
+    });
   }
 };
 
@@ -1736,36 +1755,55 @@ const handleBatchUndeploy = async () => {
   isBatchUndeploying.value = true;
   setInstancesUndeploying(targetIds, true);
   const successNames: string[] = [];
-  const successIds: string[] = [];
   const failNames: string[] = [];
+  const failIds: string[] = [];
 
   try {
-    const promises = targetIds.map(async (id) => {
-      const ruleName = getRuleNameForInstance(id);
-      try {
-        const res = await simulationApi.undeploySimulation(id);
-        if (res.success) {
-          successNames.push(ruleName);
-          successIds.push(id);
-        } else {
-          failNames.push(ruleName);
+    const results = await mapWithConcurrency(
+      targetIds,
+      BATCH_UNDEPLOY_CONCURRENCY,
+      async (id) => {
+        const ruleName = getRuleNameForInstance(id);
+        try {
+          const res = await simulationApi.undeploySimulation(id);
+          if (res.success) {
+            instances.value = instances.value.filter(
+              (instance) => instance.instanceId !== id,
+            );
+            selectedInstanceIds.value = selectedInstanceIds.value.filter(
+              (instanceId) => instanceId !== id,
+            );
+          }
+          return { id, ruleName, success: res.success };
+        } catch {
+          return { id, ruleName, success: false };
+        } finally {
+          setInstancesUndeploying([id], false);
         }
-      } catch {
-        failNames.push(ruleName);
-      }
-    });
+      },
+    );
 
-    await Promise.all(promises);
+    for (const result of results) {
+      if (result.success) {
+        successNames.push(result.ruleName);
+      } else {
+        failNames.push(result.ruleName);
+        failIds.push(result.id);
+      }
+    }
 
     if (failNames.length === 0) {
       notificationStore.success(
         t("app.simulation.deployments.messages.batchUndeploySuccess", {
+          count: successNames.length,
           names: formatNamesList(successNames),
         }),
       );
     } else if (successNames.length > 0) {
       notificationStore.warning(
         t("app.simulation.deployments.messages.batchUndeployPartial", {
+          successCount: successNames.length,
+          failCount: failNames.length,
           successNames: formatNamesList(successNames),
           failNames: formatNamesList(failNames),
         }),
@@ -1773,18 +1811,13 @@ const handleBatchUndeploy = async () => {
     } else {
       notificationStore.error(
         t("app.simulation.deployments.messages.batchUndeployFailed", {
+          count: failNames.length,
           names: formatNamesList(failNames),
         }),
       );
     }
 
-    if (successIds.length > 0) {
-      const removed = new Set(successIds);
-      instances.value = instances.value.filter(
-        (inst) => !removed.has(inst.instanceId),
-      );
-    }
-    selectedInstanceIds.value = [];
+    selectedInstanceIds.value = failIds;
   } catch {
     notificationStore.error(
       t("app.simulation.deployments.messages.batchUndeployError"),

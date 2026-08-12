@@ -464,13 +464,18 @@ export const simulationApi = {
       ? { success: true, data: mapInstance(res.data) }
       : fail<SimInstance>(res);
   },
-  async undeploySimulation(instanceId: string) {
-    return request<unknown>(
+  async undeploySimulation(
+    instanceId: string,
+  ): Promise<ApiEnvelope<SimInstance>> {
+    const res = await request<SuiteInstance>(
       apiUrl(`/api/instances/${encodeURIComponent(instanceId)}/undeploy`),
       {
         method: "POST",
       },
     );
+    return res.success && res.data
+      ? { success: true, data: mapInstance(res.data) }
+      : fail<SimInstance>(res);
   },
   async listInstances(): Promise<ApiEnvelope<SimInstance[]>> {
     const res = await request<SuiteInstance[]>(apiUrl("/api/instances"));

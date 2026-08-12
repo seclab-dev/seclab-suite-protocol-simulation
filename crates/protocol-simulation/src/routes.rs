@@ -510,7 +510,7 @@ async fn undeploy_instance(
     Path(id): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     let operation_context = operation_context(&headers);
-    let _guard = state.pcap_finalization_lock.lock().await;
+    let _guard = state.instance_lifecycle_locks.lock(&id).await;
     let Some(instance) = db::get_instance(&state.db, &id).await? else {
         return Err(ApiError::not_found("instance not found"));
     };
@@ -518,7 +518,7 @@ async fn undeploy_instance(
         && let Err(err) = state.agent.stop_workload(workload_id).await
     {
         let error_message = format!("{err:#}");
-        let updated = db::update_instance_status(
+        db::update_instance_status(
             &state.db,
             &id,
             "error",
@@ -542,16 +542,13 @@ async fn undeploy_instance(
             .expect("static operation event must be valid"),
         )
         .await;
-        return Ok(Json(ApiEnvelope {
-            success: true,
-            data: updated.unwrap_or(instance),
-        }));
+        return Err(ApiError::from(err));
     }
     if let Err(err) =
         pcap::remove_capture_file(&state.config.data_dir, instance.pcap_file_path.as_deref()).await
     {
         let error_message = format!("{err:#}");
-        let updated = db::update_instance_status(
+        db::update_instance_status(
             &state.db,
             &id,
             "error",
@@ -578,10 +575,7 @@ async fn undeploy_instance(
             .expect("static operation event must be valid"),
         )
         .await;
-        return Ok(Json(ApiEnvelope {
-            success: true,
-            data: updated.unwrap_or(instance),
-        }));
+        return Err(ApiError::from(err));
     }
     let deleted = instance;
     db::delete_instance(&state.db, &id).await?;
@@ -649,7 +643,7 @@ async fn start_pcap(
     Path(id): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     let operation_context = operation_context(&headers);
-    let _guard = state.pcap_finalization_lock.lock().await;
+    let _guard = state.instance_lifecycle_locks.lock(&id).await;
     let Some(instance) = db::get_instance(&state.db, &id).await? else {
         return Err(ApiError::not_found("instance not found"));
     };
@@ -857,7 +851,7 @@ async fn finalize_pcap_capture(
     instance_id: &str,
     expected_capture_id: Option<&str>,
 ) -> anyhow::Result<Option<(Instance, bool)>> {
-    let _guard = state.pcap_finalization_lock.lock().await;
+    let _guard = state.instance_lifecycle_locks.lock(instance_id).await;
     let Some(instance) = db::get_instance(&state.db, instance_id).await? else {
         return Ok(None);
     };
@@ -910,7 +904,7 @@ async fn delete_pcap(
     Path(id): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     let operation_context = operation_context(&headers);
-    let _guard = state.pcap_finalization_lock.lock().await;
+    let _guard = state.instance_lifecycle_locks.lock(&id).await;
     let Some(instance) = db::get_instance(&state.db, &id).await? else {
         return Err(ApiError::not_found("instance not found"));
     };

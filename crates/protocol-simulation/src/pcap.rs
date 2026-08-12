@@ -79,7 +79,7 @@ fn capture_file_path(data_dir: &Path, file_name: &str) -> anyhow::Result<PathBuf
 
 fn is_managed_capture_file(file_name: &str) -> bool {
     file_name
-        .strip_prefix("pcap_instance-")
+        .strip_prefix("pcap_")
         .and_then(|value| value.strip_suffix(".pcap"))
         .is_some_and(|value| {
             !value.is_empty()
@@ -91,7 +91,7 @@ fn is_managed_capture_file(file_name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{cleanup_orphaned_capture_files, remove_capture_file};
+    use super::{capture_file_name, cleanup_orphaned_capture_files, remove_capture_file};
     use std::collections::HashSet;
 
     #[tokio::test]
@@ -130,17 +130,18 @@ mod tests {
         let data_dir = tempfile::tempdir().unwrap();
         let pcap_dir = data_dir.path().join("pcap");
         tokio::fs::create_dir_all(&pcap_dir).await.unwrap();
-        tokio::fs::write(pcap_dir.join("pcap_instance-1.pcap"), b"pcap")
+        let file_name = capture_file_name("sim-019ff3b6-bb91-7f40-bee8-fb4689a0e599");
+        tokio::fs::write(pcap_dir.join(&file_name), b"pcap")
             .await
             .unwrap();
 
         assert!(
-            remove_capture_file(data_dir.path(), Some("pcap_instance-1.pcap"))
+            remove_capture_file(data_dir.path(), Some(&file_name))
                 .await
                 .unwrap()
         );
         assert!(
-            !remove_capture_file(data_dir.path(), Some("pcap_instance-1.pcap"))
+            !remove_capture_file(data_dir.path(), Some(&file_name))
                 .await
                 .unwrap()
         );

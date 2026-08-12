@@ -268,12 +268,13 @@ const en = {
             'Simulation service "{name}" successfully undeployed',
           undeployFailed: 'Failed to undeploy simulation service "{name}"',
           undeployError: 'Error undeploying simulation service "{name}"',
+          truncatedInstanceNames: "{names}, and {count} more instances",
           batchUndeploySuccess:
-            "Successfully undeployed simulation services: {names}",
+            "Successfully undeployed {count} simulation services: {names}",
           batchUndeployPartial:
-            "Part of simulation services failed to undeploy. Success: {successNames}; Failed: {failNames}",
+            "Batch undeployment completed: {successCount} succeeded ({successNames}); {failCount} failed ({failNames})",
           batchUndeployFailed:
-            "Failed to undeploy simulation services: {names}",
+            "Failed to undeploy all {count} simulation services: {names}",
           batchUndeployError: "Error batch undeploying service instances",
         },
       },
