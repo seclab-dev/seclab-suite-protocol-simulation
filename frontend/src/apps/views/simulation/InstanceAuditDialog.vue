@@ -249,10 +249,7 @@ onUnmounted(() => {
             </SecLabTag>
           </template>
           <template #summary="{ row }">
-            <SecLabTooltip
-              :text="row.detailSummary + '\n' + JSON.stringify(row.metadata)"
-              position="top"
-            >
+            <SecLabTooltip :text="row.detailSummary" position="top">
               <div class="audit-summary" data-ui="audit-summary">
                 {{ row.detailSummary }}
               </div>
