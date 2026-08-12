@@ -33,7 +33,6 @@ import {
   registerConfirmationHandler,
   useConfirmationModalStore,
 } from "@/stores/confirmation-modal";
-import { notifyHost } from "@/suite-bridge";
 import SimulationRuleDetailDialog from "./simulation/SimulationRuleDetailDialog.vue";
 import InstanceAuditDialog from "./simulation/InstanceAuditDialog.vue";
 
@@ -345,6 +344,7 @@ const isBatchUndeploying = ref(false);
 
 /** 限制同时销毁的工作负载数量，避免批量请求压垮 Agent。 */
 const BATCH_UNDEPLOY_CONCURRENCY = 4;
+const BATCH_UNDEPLOY_NOTIFICATION_DURATION = 10_000;
 
 const mapWithConcurrency = async <T, R>(
   items: T[],
@@ -735,14 +735,7 @@ const handleStopCapture = async (row: SimInstance) => {
       clearPcapStartClientTime(row.instanceId);
       if (res.data.pcapStatus === "idle") {
         const message = t("app.simulation.forensic.messages.emptyPcap");
-        const delivered = notifyHost({
-          type: "warning",
-          title: t("notification.title.warning"),
-          message,
-        });
-        if (!delivered) {
-          notificationStore.warning(message);
-        }
+        notificationStore.warning(message);
       } else {
         notificationStore.success(
           t("app.simulation.forensic.messages.stopSuccess"),
@@ -1798,6 +1791,7 @@ const handleBatchUndeploy = async () => {
           count: successNames.length,
           names: formatNamesList(successNames),
         }),
+        BATCH_UNDEPLOY_NOTIFICATION_DURATION,
       );
     } else if (successNames.length > 0) {
       notificationStore.warning(
@@ -1807,6 +1801,7 @@ const handleBatchUndeploy = async () => {
           successNames: formatNamesList(successNames),
           failNames: formatNamesList(failNames),
         }),
+        BATCH_UNDEPLOY_NOTIFICATION_DURATION,
       );
     } else {
       notificationStore.error(
@@ -1814,6 +1809,7 @@ const handleBatchUndeploy = async () => {
           count: failNames.length,
           names: formatNamesList(failNames),
         }),
+        BATCH_UNDEPLOY_NOTIFICATION_DURATION,
       );
     }
 
@@ -1821,6 +1817,7 @@ const handleBatchUndeploy = async () => {
   } catch {
     notificationStore.error(
       t("app.simulation.deployments.messages.batchUndeployError"),
+      BATCH_UNDEPLOY_NOTIFICATION_DURATION,
     );
   } finally {
     setInstancesUndeploying(targetIds, false);
