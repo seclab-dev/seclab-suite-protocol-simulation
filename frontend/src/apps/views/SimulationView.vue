@@ -97,16 +97,36 @@ const protocolCapabilities = ref<SimulationProtocolCapability[]>(
     customRuleCreatable: true,
     eventTypes: [],
     category: "other",
-    endpoints: [
-      {
-        id: "main",
-        role: "service",
-        transport: "tcp",
-        containerPort: SIMULATION_PROTOCOL_DEFAULT_PORTS[item.value],
-        defaultHostPort: SIMULATION_PROTOCOL_DEFAULT_PORTS[item.value],
-        required: true,
-      },
-    ],
+    endpoints:
+      item.value === "dns"
+        ? [
+            {
+              id: "dns-tcp",
+              role: "service",
+              transport: "tcp",
+              containerPort: 53,
+              defaultHostPort: 1053,
+              required: true,
+            },
+            {
+              id: "dns-udp",
+              role: "service",
+              transport: "udp",
+              containerPort: 53,
+              defaultHostPort: 1053,
+              required: true,
+            },
+          ]
+        : [
+            {
+              id: "main",
+              role: "service",
+              transport: item.value === "snmp" ? "udp" : "tcp",
+              containerPort: SIMULATION_PROTOCOL_DEFAULT_PORTS[item.value],
+              defaultHostPort: SIMULATION_PROTOCOL_DEFAULT_PORTS[item.value],
+              required: true,
+            },
+          ],
     fields: [],
   })),
 );
@@ -942,17 +962,32 @@ const dynamicProtocolFields = computed(() =>
   (currentProtocolCapability.value?.fields ?? []).filter(
     (field) =>
       ["text", "string_list", "number"].includes(field.kind) &&
-      !["banner", "server_header", "hostname", "password"].includes(field.path),
+      !["banner", "server_header", "password"].includes(field.path) &&
+      !(
+        field.path === "hostname" &&
+        ["smtp", "pop3", "imap"].includes(ruleForm.value.protocol)
+      ),
   ),
 );
 
 const isHttpRuleForm = computed(() => ruleForm.value.protocol === "http");
 const isRedisRuleForm = computed(() => ruleForm.value.protocol === "redis");
-const isDnsRuleForm = computed(() => ruleForm.value.protocol === "dns");
+const keyValueFieldPath = computed(() => {
+  if (ruleForm.value.protocol === "redis") return "keys";
+  if (ruleForm.value.protocol === "dns") return "records";
+  if (ruleForm.value.protocol === "memcached") return "stats";
+  if (ruleForm.value.protocol === "snmp") return "oids";
+  return "";
+});
+const isKeyValueRuleForm = computed(() => Boolean(keyValueFieldPath.value));
+const keyValueLocaleSection = computed(() => {
+  if (ruleForm.value.protocol === "dns") return "dnsRecords";
+  if (ruleForm.value.protocol === "memcached") return "memcachedStats";
+  if (ruleForm.value.protocol === "snmp") return "snmpOids";
+  return "redisKeys";
+});
 const keyValueText = (key: string) =>
-  t(
-    `app.simulation.rules.${isDnsRuleForm.value ? "dnsRecords" : "redisKeys"}.${key}`,
-  );
+  t(`app.simulation.rules.${keyValueLocaleSection.value}.${key}`);
 const isMailRuleForm = computed(() =>
   ["smtp", "pop3", "imap"].includes(ruleForm.value.protocol),
 );
@@ -1019,7 +1054,13 @@ const resetProtocolSpecificForm = (protocol: SimulationProtocol) => {
         ? "8.0.36-seclab"
         : protocol === "postgresql"
           ? "16.2-seclab"
-          : "",
+          : protocol === "mongodb"
+            ? "7.0.14-seclab"
+            : protocol === "memcached"
+              ? "1.6.24"
+              : "",
+    hostname: protocol === "mongodb" ? "mongodb-seclab" : "",
+    max_wire_version: protocol === "mongodb" ? "21" : "",
     databases: "",
     server_name: protocol === "smb" ? "SECLAB" : "",
     domain: protocol === "smb" ? "LAB" : "",
@@ -1028,12 +1069,19 @@ const resetProtocolSpecificForm = (protocol: SimulationProtocol) => {
     prompt: protocol === "telnet" ? "$ " : "",
     default_ipv4: protocol === "dns" ? "192.0.2.53" : "",
     ttl: protocol === "dns" ? "60" : "",
+    community: protocol === "snmp" ? "public" : "",
+    system_description: protocol === "snmp" ? "Linux seclab-snmp 6.8.0" : "",
+    system_name: protocol === "snmp" ? "snmp-seclab" : "",
+    system_location: protocol === "snmp" ? "SecLab" : "",
+    protocol_version: protocol === "vnc" ? "3.8" : "",
+    security_types: protocol === "vnc" ? "none" : "",
   };
   exploitPaths.value = [];
   redisKeys.value =
     protocol === "dns"
       ? [{ key: "dns.seclab.local", value: "192.0.2.53" }]
       : [];
+  ruleForm.value.allowAnonymous = protocol === "mqtt";
   commandResponses.value = [];
   credentials.value = isCredentialRuleForm.value
     ? [
@@ -1337,6 +1385,52 @@ const buildRuleConfig = () => {
       ),
       default_ipv4: dynamicFieldValues.value.default_ipv4 || undefined,
       ttl: parseInt(dynamicFieldValues.value.ttl || "60", 10) || 60,
+    };
+  }
+
+  if (protocol === "mongodb") {
+    return {
+      server_version: dynamicFieldValues.value.server_version || undefined,
+      hostname: dynamicFieldValues.value.hostname || undefined,
+      max_wire_version:
+        parseInt(dynamicFieldValues.value.max_wire_version || "21", 10) || 21,
+    };
+  }
+
+  if (protocol === "memcached") {
+    return {
+      server_version: dynamicFieldValues.value.server_version || undefined,
+      stats: Object.fromEntries(
+        redisKeys.value
+          .filter((item) => item.key)
+          .map((item) => [item.key, item.value]),
+      ),
+    };
+  }
+
+  if (protocol === "snmp") {
+    return {
+      community: dynamicFieldValues.value.community || "public",
+      system_description:
+        dynamicFieldValues.value.system_description || undefined,
+      system_name: dynamicFieldValues.value.system_name || undefined,
+      system_location: dynamicFieldValues.value.system_location || undefined,
+      oids: Object.fromEntries(
+        redisKeys.value
+          .filter((item) => item.key)
+          .map((item) => [item.key, item.value]),
+      ),
+    };
+  }
+
+  if (protocol === "mqtt") {
+    return { allow_anonymous: ruleForm.value.allowAnonymous };
+  }
+
+  if (protocol === "vnc") {
+    return {
+      protocol_version: dynamicFieldValues.value.protocol_version || "3.8",
+      security_types: splitDynamicList("security_types"),
     };
   }
 
@@ -2537,7 +2631,13 @@ const handleDownloadPcap = async (row: SimInstance) => {
             </label>
             <SecLabInput
               v-model="dynamicFieldValues[field.path]"
-              :type="field.kind === 'number' ? 'number' : 'text'"
+              :type="
+                field.secret
+                  ? 'password'
+                  : field.kind === 'number'
+                    ? 'number'
+                    : 'text'
+              "
               :placeholder="
                 field.kind === 'string_list'
                   ? t('app.simulation.rules.editor.listHint')
@@ -2611,7 +2711,10 @@ const handleDownloadPcap = async (row: SimInstance) => {
               "
             />
           </div>
-          <div v-if="ruleForm.protocol === 'ftp'" class="form-group">
+          <div
+            v-if="ruleForm.protocol === 'ftp' || ruleForm.protocol === 'mqtt'"
+            class="form-group"
+          >
             <label>{{ t("app.simulation.rules.fields.allowAnonymous") }}</label>
             <div class="inline-check-row">
               <SecLabCheckbox
@@ -2746,9 +2849,7 @@ const handleDownloadPcap = async (row: SimInstance) => {
         </div>
 
         <div
-          v-if="
-            ruleEditorMode === 'guided' && (isRedisRuleForm || isDnsRuleForm)
-          "
+          v-if="ruleEditorMode === 'guided' && isKeyValueRuleForm"
           class="section-card card-box"
         >
           <div class="drawer-card-header" data-slot="header">

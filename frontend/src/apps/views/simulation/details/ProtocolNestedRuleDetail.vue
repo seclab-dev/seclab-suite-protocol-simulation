@@ -35,6 +35,19 @@ const dnsRecordRows = computed(() => {
     address: String(address),
   }));
 });
+
+const probeMapRows = computed(() => {
+  const path = props.protocol === "memcached" ? "stats" : "oids";
+  if (!["memcached", "snmp"].includes(props.protocol)) return [];
+  const values = props.config?.[path];
+  if (!values || typeof values !== "object" || Array.isArray(values)) {
+    return [];
+  }
+  return Object.entries(values).map(([key, value]) => ({
+    key,
+    value: String(value),
+  }));
+});
 </script>
 
 <template>
@@ -131,6 +144,48 @@ const dnsRecordRows = computed(() => {
             prop: 'address',
             label: t('app.simulation.rules.dnsRecords.value'),
             minWidth: 180,
+          },
+        ]"
+        border
+      >
+        <template #index="{ index }">{{ index + 1 }}</template>
+      </SecLabTable>
+    </div>
+  </div>
+
+  <div
+    v-if="probeMapRows.length"
+    class="section-card"
+    data-slot="probe-map-detail"
+  >
+    <h4>
+      {{
+        t(
+          `app.simulation.rules.detailSections.${
+            protocol === "memcached" ? "memcachedStats" : "snmpOids"
+          }`,
+        )
+      }}
+    </h4>
+    <div class="table-scroll-container">
+      <SecLabTable
+        :data="probeMapRows"
+        :columns="[
+          {
+            label: t('common.index'),
+            width: 70,
+            align: 'center',
+            slot: 'index',
+          },
+          {
+            prop: 'key',
+            label: t('app.simulation.rules.fields.key'),
+            minWidth: 260,
+          },
+          {
+            prop: 'value',
+            label: t('app.simulation.rules.fields.value'),
+            minWidth: 220,
           },
         ]"
         border

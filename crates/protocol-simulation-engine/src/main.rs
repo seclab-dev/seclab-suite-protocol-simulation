@@ -2,8 +2,9 @@ mod simulation;
 
 use anyhow::Context;
 use protocol_simulation_common::{
-    BoundEndpoint, EngineLaunchConfig, ProtocolId, TransportProtocol,
+    BoundEndpoint, EngineLaunchConfig, ProtocolId, TransportProtocol, protocol_descriptor,
 };
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::oneshot;
@@ -101,17 +102,35 @@ fn validated_endpoints(config: &EngineLaunchConfig) -> anyhow::Result<Vec<BoundE
     if config.endpoints.is_empty() {
         anyhow::bail!("simulation launch config does not contain an endpoint");
     }
-    if config.protocol != ProtocolId::Dns
-        && let Some(endpoint) = config
+    let descriptor = protocol_descriptor(config.protocol);
+    let mut seen = HashSet::new();
+    for endpoint in &config.endpoints {
+        if !seen.insert(endpoint.endpoint_id.as_str()) {
+            anyhow::bail!("duplicate simulation endpoint: {}", endpoint.endpoint_id);
+        }
+        let expected = descriptor
             .endpoints
             .iter()
-            .find(|endpoint| endpoint.transport != TransportProtocol::Tcp)
+            .find(|candidate| candidate.id == endpoint.endpoint_id)
+            .with_context(|| format!("unknown simulation endpoint: {}", endpoint.endpoint_id))?;
+        if endpoint.transport != expected.transport
+            || endpoint.container_port != expected.container_port
+        {
+            anyhow::bail!(
+                "simulation endpoint {} does not match the {} protocol descriptor",
+                endpoint.endpoint_id,
+                config.protocol.as_str()
+            );
+        }
+    }
+    for expected in descriptor
+        .endpoints
+        .iter()
+        .filter(|endpoint| endpoint.required)
     {
-        anyhow::bail!(
-            "protocol {} endpoint {} requires an unsupported engine transport",
-            config.protocol.as_str(),
-            endpoint.endpoint_id
-        );
+        if !seen.contains(expected.id.as_str()) {
+            anyhow::bail!("required simulation endpoint is missing: {}", expected.id);
+        }
     }
     Ok(config.endpoints.clone())
 }
@@ -323,6 +342,59 @@ async fn run_tcp_simulation(
             )
             .await
         }
+        ProtocolId::Mongodb => {
+            simulation::start_mongodb_simulation(
+                config.rule_id,
+                rule_name,
+                port,
+                callback_url,
+                node_id,
+                parse_rule_config(config.behavior)?,
+                listener,
+                shutdown_rx,
+            )
+            .await
+        }
+        ProtocolId::Memcached => {
+            simulation::start_memcached_simulation(
+                config.rule_id,
+                rule_name,
+                port,
+                callback_url,
+                node_id,
+                parse_rule_config(config.behavior)?,
+                listener,
+                shutdown_rx,
+            )
+            .await
+        }
+        ProtocolId::Mqtt => {
+            simulation::start_mqtt_simulation(
+                config.rule_id,
+                rule_name,
+                port,
+                callback_url,
+                node_id,
+                parse_rule_config(config.behavior)?,
+                listener,
+                shutdown_rx,
+            )
+            .await
+        }
+        ProtocolId::Vnc => {
+            simulation::start_vnc_simulation(
+                config.rule_id,
+                rule_name,
+                port,
+                callback_url,
+                node_id,
+                parse_rule_config(config.behavior)?,
+                listener,
+                shutdown_rx,
+            )
+            .await
+        }
+        ProtocolId::Snmp => anyhow::bail!("SNMP requires a UDP endpoint"),
     }
 }
 
@@ -332,25 +404,41 @@ async fn run_udp_simulation(
     socket: UdpSocket,
     shutdown_rx: oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
-    if config.protocol != ProtocolId::Dns {
-        anyhow::bail!(
+    match config.protocol {
+        ProtocolId::Dns => {
+            simulation::start_dns_udp_simulation(
+                config.rule_id,
+                Some(config.rule_name),
+                endpoint.endpoint_id,
+                endpoint.container_port,
+                config.callback_url,
+                env_string("SECLAB_NODE_ID", "local"),
+                parse_rule_config(config.behavior)?,
+                socket,
+                shutdown_rx,
+            )
+            .await
+        }
+        ProtocolId::Snmp => {
+            simulation::start_snmp_simulation(
+                config.rule_id,
+                Some(config.rule_name),
+                endpoint.endpoint_id,
+                endpoint.container_port,
+                config.callback_url,
+                env_string("SECLAB_NODE_ID", "local"),
+                parse_rule_config(config.behavior)?,
+                socket,
+                shutdown_rx,
+            )
+            .await
+        }
+        _ => anyhow::bail!(
             "protocol {} does not support UDP endpoint {}",
             config.protocol.as_str(),
             endpoint.endpoint_id
-        );
+        ),
     }
-    simulation::start_dns_udp_simulation(
-        config.rule_id,
-        Some(config.rule_name),
-        endpoint.endpoint_id,
-        endpoint.container_port,
-        config.callback_url,
-        env_string("SECLAB_NODE_ID", "local"),
-        parse_rule_config(config.behavior)?,
-        socket,
-        shutdown_rx,
-    )
-    .await
 }
 
 fn launch_config_from_env() -> anyhow::Result<EngineLaunchConfig> {

@@ -12,7 +12,12 @@ export type SimulationProtocol =
   | "postgresql"
   | "smb"
   | "ldap"
-  | "dns";
+  | "dns"
+  | "mongodb"
+  | "memcached"
+  | "snmp"
+  | "mqtt"
+  | "vnc";
 
 export const SIMULATION_PROTOCOL_OPTIONS: {
   value: SimulationProtocol;
@@ -32,6 +37,11 @@ export const SIMULATION_PROTOCOL_OPTIONS: {
   { value: "smb", label: "SMB" },
   { value: "ldap", label: "LDAP" },
   { value: "dns", label: "DNS" },
+  { value: "mongodb", label: "MONGODB" },
+  { value: "memcached", label: "MEMCACHED" },
+  { value: "snmp", label: "SNMP" },
+  { value: "mqtt", label: "MQTT" },
+  { value: "vnc", label: "VNC" },
 ];
 
 export const SIMULATION_PROTOCOL_DEFAULT_PORTS: Record<
@@ -52,6 +62,11 @@ export const SIMULATION_PROTOCOL_DEFAULT_PORTS: Record<
   smb: 445,
   ldap: 389,
   dns: 1053,
+  mongodb: 27017,
+  memcached: 11211,
+  snmp: 161,
+  mqtt: 1883,
+  vnc: 5900,
 };
 
 export interface SimulationEndpointCapability {

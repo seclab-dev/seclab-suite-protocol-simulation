@@ -2,6 +2,7 @@
 
 pub use protocol_simulation_common::{
     MailCredential, MailCustomResponse, MailMessage, SimDatabaseConfig, SimDnsConfig, SimFtpConfig,
-    SimHttpConfig, SimImapConfig, SimLdapConfig, SimPop3Config, SimRdpConfig, SimRedisConfig,
-    SimSmbConfig, SimSmtpConfig, SimSshConfig, SimTelnetConfig,
+    SimHttpConfig, SimImapConfig, SimLdapConfig, SimMemcachedConfig, SimMongodbConfig,
+    SimMqttConfig, SimPop3Config, SimRdpConfig, SimRedisConfig, SimSmbConfig, SimSmtpConfig,
+    SimSnmpConfig, SimSshConfig, SimTelnetConfig, SimVncConfig,
 };

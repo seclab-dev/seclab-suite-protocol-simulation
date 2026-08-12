@@ -54,7 +54,9 @@ API 服务默认监听 `8080`，数据目录为 `/data`，可通过 `SECLAB_SUIT
 
 规则包导入、实例部署、下线和取证接口由套件 API 提供；主控只负责安装套件、代理入口、注入运行配置和展示统一通知。
 
-当前 v1 能力目录覆盖 HTTP、Redis、SMTP、POP3、IMAP、SSH、FTP、RDP、Telnet、MySQL、PostgreSQL、SMB、LDAP 和 DNS。DNS 规则同时声明 53/TCP 与 53/UDP 容器端点；部署时只需配置一个主机端口，默认以主机端口 1053 同时发布 TCP 与 UDP。实例、Agent workload、整工作负载 PCAP、engine 启动描述和审计事件均使用具名端点。
+当前 v1 能力目录覆盖 HTTP、Redis、SMTP、POP3、IMAP、SSH、FTP、RDP、Telnet、MySQL、PostgreSQL、SMB、LDAP、DNS、MongoDB、Memcached、SNMP、MQTT 和 VNC。DNS 规则同时声明 53/TCP 与 53/UDP 容器端点；SNMP 声明 161/UDP 端点。实例、Agent workload、整工作负载 PCAP、engine 启动描述和审计事件均使用具名端点。
+
+MongoDB、Memcached、SNMP、MQTT 和 VNC 当前提供面向扫描识别的握手、版本或探测响应，不提供完整数据库、缓存、消息代理、SNMPv3 或远程桌面会话。
 
 SecLab 会把 `/run/seclab-agent/runtime.json` 及实例令牌以只读方式注入套件。套件 API 根据描述自动连接本地 UDS 或节点 mTLS HTTPS，不读取 Agent mode，也不接受客户端自行指定套件实例身份。
 

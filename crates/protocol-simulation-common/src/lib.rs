@@ -60,10 +60,15 @@ pub enum ProtocolId {
     Smb,
     Ldap,
     Dns,
+    Mongodb,
+    Memcached,
+    Snmp,
+    Mqtt,
+    Vnc,
 }
 
 impl ProtocolId {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 19] = [
         Self::Http,
         Self::Redis,
         Self::Smtp,
@@ -78,6 +83,11 @@ impl ProtocolId {
         Self::Smb,
         Self::Ldap,
         Self::Dns,
+        Self::Mongodb,
+        Self::Memcached,
+        Self::Snmp,
+        Self::Mqtt,
+        Self::Vnc,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -96,6 +106,11 @@ impl ProtocolId {
             Self::Smb => "smb",
             Self::Ldap => "ldap",
             Self::Dns => "dns",
+            Self::Mongodb => "mongodb",
+            Self::Memcached => "memcached",
+            Self::Snmp => "snmp",
+            Self::Mqtt => "mqtt",
+            Self::Vnc => "vnc",
         }
     }
 }
@@ -166,6 +181,11 @@ pub fn protocol_descriptor(protocol: ProtocolId) -> ProtocolDescriptor {
         ProtocolId::Smb => 445,
         ProtocolId::Ldap => 389,
         ProtocolId::Dns => 53,
+        ProtocolId::Mongodb => 27017,
+        ProtocolId::Memcached => 11211,
+        ProtocolId::Snmp => 161,
+        ProtocolId::Mqtt => 1883,
+        ProtocolId::Vnc => 5900,
     };
     let fields = match protocol {
         ProtocolId::Http => vec![field("server_header", "serverHeader", "text", false, false)],
@@ -207,6 +227,45 @@ pub fn protocol_descriptor(protocol: ProtocolId) -> ProtocolDescriptor {
             field("default_ipv4", "defaultIpv4", "text", false, false),
             field("ttl", "ttl", "number", false, false),
         ],
+        ProtocolId::Mongodb => vec![
+            field("server_version", "serverVersion", "text", false, false),
+            field("hostname", "hostname", "text", false, false),
+            field("max_wire_version", "maxWireVersion", "number", false, false),
+        ],
+        ProtocolId::Memcached => vec![
+            field("server_version", "serverVersion", "text", false, false),
+            field("stats", "stats", "key_value", false, false),
+        ],
+        ProtocolId::Snmp => vec![
+            field("community", "community", "text", false, true),
+            field(
+                "system_description",
+                "systemDescription",
+                "text",
+                false,
+                false,
+            ),
+            field("system_name", "systemName", "text", false, false),
+            field("system_location", "systemLocation", "text", false, false),
+            field("oids", "oids", "key_value", false, false),
+        ],
+        ProtocolId::Mqtt => vec![field(
+            "allow_anonymous",
+            "allowAnonymous",
+            "boolean",
+            false,
+            false,
+        )],
+        ProtocolId::Vnc => vec![
+            field("protocol_version", "protocolVersion", "text", false, false),
+            field(
+                "security_types",
+                "securityTypes",
+                "string_list",
+                false,
+                false,
+            ),
+        ],
         ProtocolId::Telnet => vec![
             field("banner", "banner", "text", false, false),
             field("prompt", "prompt", "text", false, false),
@@ -217,8 +276,8 @@ pub fn protocol_descriptor(protocol: ProtocolId) -> ProtocolDescriptor {
             field("credentials", "credentials", "credentials", false, true),
         ],
     };
-    let endpoints = if protocol == ProtocolId::Dns {
-        vec![
+    let endpoints = match protocol {
+        ProtocolId::Dns => vec![
             EndpointSpec {
                 id: "dns-tcp".to_string(),
                 role: "service".to_string(),
@@ -235,16 +294,37 @@ pub fn protocol_descriptor(protocol: ProtocolId) -> ProtocolDescriptor {
                 default_host_port: 1053,
                 required: true,
             },
-        ]
-    } else {
-        vec![EndpointSpec {
+        ],
+        ProtocolId::Snmp => vec![EndpointSpec {
+            id: "main".to_string(),
+            role: "service".to_string(),
+            transport: TransportProtocol::Udp,
+            container_port: port,
+            default_host_port: port,
+            required: true,
+        }],
+        _ => vec![EndpointSpec {
             id: "main".to_string(),
             role: "service".to_string(),
             transport: TransportProtocol::Tcp,
             container_port: port,
             default_host_port: port,
             required: true,
-        }]
+        }],
+    };
+    let event_types = match protocol {
+        ProtocolId::Mongodb => vec!["mongodb_command".to_string()],
+        ProtocolId::Memcached => vec!["memcached_command".to_string()],
+        ProtocolId::Snmp => vec!["snmp_query".to_string()],
+        ProtocolId::Mqtt => vec!["mqtt_connect".to_string(), "mqtt_control".to_string()],
+        ProtocolId::Vnc => vec!["vnc_handshake".to_string()],
+        _ => vec![
+            "connection".to_string(),
+            "auth_attempt".to_string(),
+            "command".to_string(),
+            "query".to_string(),
+            "exploit_attempt".to_string(),
+        ],
     };
     ProtocolDescriptor {
         protocol,
@@ -252,24 +332,27 @@ pub fn protocol_descriptor(protocol: ProtocolId) -> ProtocolDescriptor {
         category: protocol_category(protocol).to_string(),
         endpoints,
         fields,
-        event_types: vec![
-            "connection".to_string(),
-            "auth_attempt".to_string(),
-            "command".to_string(),
-            "query".to_string(),
-            "exploit_attempt".to_string(),
-        ],
+        event_types,
     }
 }
 
 const fn protocol_category(protocol: ProtocolId) -> &'static str {
     match protocol {
-        ProtocolId::Redis | ProtocolId::Mysql | ProtocolId::Postgresql => "database",
+        ProtocolId::Redis
+        | ProtocolId::Mysql
+        | ProtocolId::Postgresql
+        | ProtocolId::Mongodb
+        | ProtocolId::Memcached => "database",
         ProtocolId::Smtp | ProtocolId::Pop3 | ProtocolId::Imap => "mail",
         ProtocolId::Smb | ProtocolId::Ldap => "enterprise",
-        ProtocolId::Telnet | ProtocolId::Ssh | ProtocolId::Rdp | ProtocolId::Ftp => "remote_access",
+        ProtocolId::Telnet
+        | ProtocolId::Ssh
+        | ProtocolId::Rdp
+        | ProtocolId::Ftp
+        | ProtocolId::Vnc => "remote_access",
         ProtocolId::Http => "web",
-        ProtocolId::Dns => "network",
+        ProtocolId::Dns | ProtocolId::Snmp => "network",
+        ProtocolId::Mqtt => "messaging",
     }
 }
 
@@ -489,6 +572,44 @@ pub struct SimDnsConfig {
     pub ttl: Option<u32>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SimMongodbConfig {
+    pub server_version: Option<String>,
+    pub hostname: Option<String>,
+    pub max_wire_version: Option<i32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SimMemcachedConfig {
+    pub server_version: Option<String>,
+    pub stats: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SimSnmpConfig {
+    pub community: Option<String>,
+    pub system_description: Option<String>,
+    pub system_name: Option<String>,
+    pub system_location: Option<String>,
+    pub oids: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SimMqttConfig {
+    pub allow_anonymous: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SimVncConfig {
+    pub protocol_version: Option<String>,
+    pub security_types: Option<Vec<String>>,
+}
+
 pub fn validate_behavior(protocol: ProtocolId, value: Value) -> Result<Value, serde_json::Error> {
     match protocol {
         ProtocolId::Http => round_trip::<SimHttpConfig>(value),
@@ -504,6 +625,11 @@ pub fn validate_behavior(protocol: ProtocolId, value: Value) -> Result<Value, se
         ProtocolId::Smb => round_trip::<SimSmbConfig>(value),
         ProtocolId::Ldap => round_trip::<SimLdapConfig>(value),
         ProtocolId::Dns => round_trip::<SimDnsConfig>(value),
+        ProtocolId::Mongodb => round_trip::<SimMongodbConfig>(value),
+        ProtocolId::Memcached => round_trip::<SimMemcachedConfig>(value),
+        ProtocolId::Snmp => round_trip::<SimSnmpConfig>(value),
+        ProtocolId::Mqtt => round_trip::<SimMqttConfig>(value),
+        ProtocolId::Vnc => round_trip::<SimVncConfig>(value),
     }
 }
 
@@ -573,5 +699,15 @@ mod tests {
         assert_eq!(descriptor.endpoints[1].id, "dns-udp");
         assert_eq!(descriptor.endpoints[0].default_host_port, 1053);
         assert_eq!(descriptor.endpoints[1].default_host_port, 1053);
+    }
+
+    #[test]
+    fn snmp_capability_exposes_a_udp_endpoint_in_v1() {
+        let descriptor = protocol_descriptor(ProtocolId::Snmp);
+        assert_eq!(descriptor.endpoints.len(), 1);
+        assert_eq!(descriptor.endpoints[0].id, "main");
+        assert_eq!(descriptor.endpoints[0].transport.as_str(), "udp");
+        assert_eq!(descriptor.endpoints[0].container_port, 161);
+        assert_eq!(descriptor.endpoints[0].default_host_port, 161);
     }
 }
