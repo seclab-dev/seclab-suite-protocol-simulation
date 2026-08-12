@@ -284,8 +284,7 @@ const zh: typeof en = {
           nodeRequired: "未选中目标计算节点",
           ruleRequired: "请选择需要绑定的规则模板",
           portInvalid: "监听端口输入不合法（合法范围：1-65535）",
-          portOccupied:
-            "该端口已被正在运行的仿真实例占用，请更换端口或先下架已有实例。",
+          portOccupied: "该端口已被占用，请更换端口后重试。",
           deploySuccess: "仿真服务“{name}”部署拉起成功",
           deployFailed: "仿真服务“{name}”拉起失败",
           deployError: "拉起仿真“{name}”异常",

@@ -295,7 +295,7 @@ const en = {
           ruleRequired: "Please select a simulation rule template",
           portInvalid: "Invalid listen port (Allowed range: 1-65535)",
           portOccupied:
-            "This port is already occupied by an active simulation instance. Change the port or undeploy the existing instance first.",
+            "This port is already in use. Change the port and try again.",
           deploySuccess:
             'Simulation service "{name}" deployed and activated successfully',
           deployFailed: 'Failed to deploy simulation service "{name}"',
