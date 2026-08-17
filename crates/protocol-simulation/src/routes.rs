@@ -35,6 +35,25 @@ type ApiResult<T> = Result<T, ApiError>;
 
 const PCAP_MAX_DURATION_SECS: i64 = 300;
 
+/// 生成协议仿真动态工作负载的可读名称主体。
+///
+/// 名称由主端点宿主机端口、规则编号和协议仿真业务实例 ID 末 6 位组成；
+/// Agent 在创建动态容器时统一添加 `sl-` 前缀。
+fn simulation_workload_name(rule_id: &str, host_port: u16, instance_id: &str) -> String {
+    let rule_identifier = rule_id
+        .strip_prefix("sim-rule-")
+        .or_else(|| rule_id.strip_prefix("rule-"))
+        .unwrap_or(rule_id);
+    let compact_instance_id = instance_id
+        .chars()
+        .filter(|value| value.is_ascii_alphanumeric())
+        .collect::<String>();
+    let short_instance_id = compact_instance_id
+        .get(compact_instance_id.len().saturating_sub(6)..)
+        .unwrap_or(compact_instance_id.as_str());
+    format!("{host_port}-{rule_identifier}-{short_instance_id}")
+}
+
 #[derive(Debug)]
 struct ApiError {
     status: StatusCode,
@@ -43,6 +62,7 @@ struct ApiError {
     cause: Option<anyhow::Error>,
 }
 
+/// 组装协议仿真 API、内部回调端点和前端静态资源路由。
 pub fn router(state: Arc<AppState>) -> Router {
     let api = Router::new()
         .route("/health", get(health))
@@ -81,6 +101,7 @@ async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": true, "service": "protocol-simulation" }))
 }
 
+/// 返回协议描述、端点定义和前端功能开关。
 async fn get_capabilities() -> Json<ApiEnvelope<serde_json::Value>> {
     Json(ApiEnvelope {
         success: true,
@@ -97,6 +118,7 @@ async fn get_capabilities() -> Json<ApiEnvelope<serde_json::Value>> {
     })
 }
 
+/// 列出当前规则包和用户创建的全部仿真规则。
 async fn list_rules(State(state): State<Arc<AppState>>) -> ApiResult<impl IntoResponse> {
     let rules = db::list_rules(&state.db).await?;
     Ok(Json(ApiEnvelope {
@@ -105,6 +127,7 @@ async fn list_rules(State(state): State<Arc<AppState>>) -> ApiResult<impl IntoRe
     }))
 }
 
+/// 校验协议行为并创建用户自定义仿真规则。
 async fn create_rule(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -156,6 +179,7 @@ async fn create_rule(
     ))
 }
 
+/// 删除指定仿真规则并记录操作审计事件。
 async fn delete_rule(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -185,6 +209,7 @@ async fn delete_rule(
     }))
 }
 
+/// 返回当前已导入规则包的版本和规则统计信息。
 async fn get_current_rule_package(
     State(state): State<Arc<AppState>>,
 ) -> ApiResult<impl IntoResponse> {
@@ -195,6 +220,7 @@ async fn get_current_rule_package(
     }))
 }
 
+/// 解析并导入签名规则包，同时校验平台最低版本与规则协议。
 async fn import_rule_package(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -258,6 +284,7 @@ async fn import_rule_package(
     }))
 }
 
+/// 在与 Agent 对账后返回全部协议仿真实例。
 async fn list_instances(State(state): State<Arc<AppState>>) -> ApiResult<impl IntoResponse> {
     let instances = reconcile_instances_with_agent(&state).await?;
     Ok(Json(ApiEnvelope {
@@ -266,6 +293,10 @@ async fn list_instances(State(state): State<Arc<AppState>>) -> ApiResult<impl In
     }))
 }
 
+/// 校验规则端点、原子预留宿主机端口，并通过 Agent 部署仿真工作负载。
+///
+/// 数据库实例先进入 `deploying`；Agent 成功后记录 `workloadId` 并转为 `running`，
+/// 端口冲突时删除预留记录，其他启动错误则保留为可诊断的 `error` 实例。
 async fn deploy_instance(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -389,9 +420,14 @@ async fn deploy_instance(
             .collect(),
         behavior,
     };
+    let primary_host_port = instance
+        .endpoints
+        .first()
+        .map(|endpoint| endpoint.host_port as u16)
+        .ok_or_else(|| ApiError::bad_request("simulation instance requires an endpoint"))?;
     let agent_payload = StartWorkloadRequest {
         workload_kind: "simulation-rule".to_string(),
-        workload_name: rule.id.clone(),
+        workload_name: simulation_workload_name(&rule.id, primary_host_port, &instance_id),
         image: state.config.engine_image.clone(),
         ports: instance
             .endpoints
@@ -504,6 +540,7 @@ async fn deploy_instance(
     ))
 }
 
+/// 串行撤销指定仿真实例，依次回收 Agent 工作负载、PCAP 文件和数据库记录。
 async fn undeploy_instance(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -598,6 +635,9 @@ async fn undeploy_instance(
     }))
 }
 
+/// 将本地活动实例与 Agent 现存工作负载对账，标记已丢失负载的实例为非活动。
+///
+/// Agent 列表不可用时保留本地状态，避免因短暂通信故障误判实例已停止。
 async fn reconcile_instances_with_agent(state: &AppState) -> ApiResult<Vec<Instance>> {
     finalize_expired_pcap_captures(state).await;
     let instances = db::list_instances(&state.db).await?;
@@ -629,6 +669,7 @@ async fn reconcile_instances_with_agent(state: &AppState) -> ApiResult<Vec<Insta
     Ok(reconciled)
 }
 
+/// 判断处于部署中或运行中的实例是否已丢失对应 Agent 工作负载。
 fn should_mark_instance_inactive(instance: &Instance, workload_ids: &HashSet<String>) -> bool {
     matches!(instance.status.as_str(), "deploying" | "running")
         && instance
@@ -637,6 +678,7 @@ fn should_mark_instance_inactive(instance: &Instance, workload_ids: &HashSet<Str
             .is_some_and(|workload_id| !workload_ids.contains(workload_id))
 }
 
+/// 串行启动指定运行实例的整负载抓包，并安排超时自动停止任务。
 async fn start_pcap(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -713,6 +755,7 @@ async fn start_pcap(
     }))
 }
 
+/// 停止指定实例的抓包，将有效 PCAP 持久化后更新实例状态。
 async fn stop_pcap(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -770,6 +813,7 @@ async fn stop_pcap(
     }))
 }
 
+/// 按抓包开始时间安排最长持续时间到期任务。
 fn schedule_pcap_auto_stop(
     state: Arc<AppState>,
     instance_id: String,
@@ -784,6 +828,7 @@ fn schedule_pcap_auto_stop(
     });
 }
 
+/// 扫描并尝试结束服务重启期间遗留的过期抓包。
 async fn finalize_expired_pcap_captures(state: &AppState) {
     let Ok(instances) = db::list_instances(&state.db).await else {
         return;
@@ -801,6 +846,7 @@ async fn finalize_expired_pcap_captures(state: &AppState) {
     }
 }
 
+/// 在持续时间上限到达时结束匹配的抓包，并记录后台操作结果。
 async fn auto_stop_pcap(state: &AppState, instance_id: &str, capture_id: &str) {
     match finalize_pcap_capture(state, instance_id, Some(capture_id)).await {
         Ok(Some((_, true))) => {
@@ -846,6 +892,10 @@ async fn auto_stop_pcap(state: &AppState, instance_id: &str, capture_id: &str) {
     }
 }
 
+/// 在实例生命周期锁内结束抓包并完成 PCAP 状态转换。
+///
+/// `expected_capture_id` 用于拒绝已过期的自动停止任务；返回值中的布尔值表示本次是否
+/// 实际结束了抓包。只含 PCAP 头的空结果转为 `idle`，其他结果写入数据目录并转为 `ready`。
 async fn finalize_pcap_capture(
     state: &AppState,
     instance_id: &str,
@@ -898,6 +948,7 @@ async fn finalize_pcap_capture(
     )))
 }
 
+/// 删除指定实例的活动抓包、持久化文件和 PCAP 状态。
 async fn delete_pcap(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -976,6 +1027,7 @@ async fn delete_pcap(
     }))
 }
 
+/// 下载指定实例已就绪的 PCAP 文件，并对成功或失败结果记录操作审计。
 async fn download_pcap(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1055,6 +1107,7 @@ async fn download_pcap(
         .into_response())
 }
 
+/// 提交 PCAP 下载失败操作事件，统一携带实例目标和错误语义。
 async fn emit_capture_download_failure(
     state: &AppState,
     instance_id: &str,
@@ -1094,6 +1147,7 @@ fn default_audit_log_page_size() -> u32 {
     50
 }
 
+/// 校验分页参数并返回指定实例的审计日志页。
 async fn list_instance_logs(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1121,6 +1175,7 @@ async fn list_instance_logs(
     }))
 }
 
+/// 接收仿真引擎上报的运行时事件，校验回调令牌与端点归属后写入审计日志。
 async fn record_event(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1164,6 +1219,7 @@ async fn record_event(
     ))
 }
 
+/// 校验运行时事件的版本、标识符、时间戳以及元数据和载荷大小边界。
 fn validate_runtime_event(event: &EventRequest) -> ApiResult<()> {
     if event.schema_version != 1 {
         return Err(ApiError::bad_request(
@@ -1213,6 +1269,7 @@ fn parse_protocol(protocol: &str) -> ApiResult<ProtocolId> {
     ProtocolId::from_str(protocol).map_err(ApiError::bad_request)
 }
 
+/// 使用静态语义字段构建完整操作审计事件。
 fn operation_event(
     code: &str,
     zh_cn: &str,
@@ -1235,6 +1292,7 @@ fn operation_event(
     .expect("static operation event must be valid")
 }
 
+/// 构建带可信操作上下文和显式资源目标的审计事件生成器。
 fn operation_event_builder(
     code: &str,
     zh_cn: &str,
@@ -1257,6 +1315,7 @@ fn operation_event_builder(
     }
 }
 
+/// 从代理注入的请求头中提取并规范化可信操作上下文标识符。
 fn operation_context(headers: &HeaderMap) -> Option<String> {
     seclab_suite_runtime::operation_context_from_header(
         headers
@@ -1265,6 +1324,7 @@ fn operation_context(headers: &HeaderMap) -> Option<String> {
     )
 }
 
+/// 向 Agent 提交操作审计事件；提交失败只记录服务端错误，不改写业务结果。
 async fn emit_operation_event(state: &AppState, event: OperationEvent) {
     if let Err(error) = state.agent.submit_operation_event(&event).await {
         tracing::error!(event_id = %event.event_id, %error, "operation audit event was not accepted");
@@ -1357,6 +1417,30 @@ fn error_detail(cause: Option<&anyhow::Error>, message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn simulation_workload_name_uses_host_port_rule_number_and_instance_suffix() {
+        assert_eq!(
+            simulation_workload_name(
+                "sim-rule-190001",
+                8080,
+                "sim-019f409d-8e1d-73e0-f3dc45e75209"
+            ),
+            "8080-190001-e75209"
+        );
+    }
+
+    #[test]
+    fn simulation_workload_name_keeps_local_rule_identifier() {
+        assert_eq!(
+            simulation_workload_name(
+                "rule-019ff3b6-bb91-7f40-bee8-fb4689a0e599",
+                2222,
+                "sim-019f409d-8e1d-73e0-f3dc45abcdef"
+            ),
+            "2222-019ff3b6-bb91-7f40-bee8-fb4689a0e599-abcdef"
+        );
+    }
 
     #[test]
     fn internal_error_detail_contains_complete_error_chain() {
