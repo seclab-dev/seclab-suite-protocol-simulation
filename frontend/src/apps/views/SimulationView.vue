@@ -1962,26 +1962,12 @@ const methodOptions = computed(() => [
 ]);
 
 /**
- * 根据所属节点名称、诱捕规则及原始哈希生成更具可读性的取证数据包物理下载文件名
- * 避免了浏览器下载出现冗长杂乱的哈希，并清晰体现所属规则（如：ruleId_pcap.pcap）
+ * 根据实例监听端口和规则 ID 生成可读的 PCAP 下载文件名。
+ * 例如：`sl-8080-190001.pcap`。
  * @param row 目标仿真运行实例
  */
-const getFriendlyPcapFilename = (row: SimInstance) => {
-  if (!row.pcapFilePath) return "capture.pcap";
-
-  const ruleId = row.ruleId;
-
-  let baseName = row.pcapFilePath.replace(/^pcap_/, "");
-
-  const targetReplace = `rule_${ruleId}`;
-  if (baseName.includes(row.instanceId)) {
-    baseName = baseName.replace(row.instanceId, targetReplace);
-  } else {
-    baseName = `${targetReplace}_${baseName}`;
-  }
-
-  return baseName;
-};
+const getFriendlyPcapFilename = (row: SimInstance) =>
+  `sl-${row.listenPort}-${row.ruleId}.pcap`;
 
 /**
  * 按仿真实例下载关联取证 PCAP 包，由后端记录可信操作日志。
